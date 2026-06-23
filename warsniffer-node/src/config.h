@@ -34,8 +34,10 @@
 #define MAX_APS            96      // tracked BSSIDs
 #define MAX_STAS           256     // tracked client MACs (for client counts)
 #define MAX_ALERTS         24      // alert ring buffer
+#define MAX_PROBES         48      // unique directed probe-request SSIDs (client PNLs)
 #define UPLINK_AP_MAX      40      // APs per POST (strongest first)
 #define UPLINK_ALERT_MAX   16      // alerts per POST
+#define UPLINK_PROBE_MAX   32      // probed SSIDs per POST
 
 // ---- WIDS thresholds -------------------------------------------------------
 #define DEAUTH_WINDOW_MS       1000
@@ -45,5 +47,7 @@
 #define EVIL_TWIN_RSSI_DELTA   25    // dBm jump, same SSID new BSSID -> alert
 
 // ---- Onboard WS2812 status LED (DevKitC-1, GPIO48) -------------------------
+// Off=capture stopped, green=sniffing, blue=reporting to C2, red=recent WIDS alert.
+#define STATUS_LED_ENABLED true
 #define STATUS_LED_PIN     48
-#define LED_BRIGHTNESS     24
+#define LED_BRIGHTNESS     24      // 0-255 master brightness scale

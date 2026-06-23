@@ -19,7 +19,21 @@ or have explicit written authorization to test.**
 The three S3 nodes are headless — no display, no local web UI.  They join
 the C2's SoftAP (`ESP32-NET`) and POST JSON metadata to `/ingest` on a timer.
 The C2 aggregates everything and serves the four-tab dashboard at
-`http://192.168.4.1/`.
+`http://192.168.4.1/` (or `http://esp32net.local/` where mDNS is supported).
+
+Each headless S3 node drives its onboard WS2812 status LED so you can read its
+state in the field with no serial console:
+
+| Colour | WarDriver | WarSniffer | BlueDriver |
+|---|---|---|---|
+| green | scanning, GPS fix | sniffing | scanning |
+| cyan | scanning, no fix | — | — |
+| blue | reporting to C2 | reporting to C2 | reporting to C2 |
+| purple | — | — | GATT enum running |
+| red | — | recent WIDS alert | — |
+| amber | scan paused | capture stopped | scan paused |
+
+Set `STATUS_LED_ENABLED false` in a node's `config.h` to disable it.
 
 > **ESP32-S3 = BLE 5.0 only.** No Bluetooth Classic (BR/EDR). Hardware limit of
 > the S3 silicon. Only the original ESP32 (non-S/C) has Classic.
@@ -90,11 +104,19 @@ WigleWifi CSV is written to `/wigle.csv` on LittleFS. Flash the filesystem
 |---|---|
 | **OVERVIEW** | All-node status, aggregate counts, online/offline dots |
 | **WARDRIVER** | Scanned AP table (BSSID, SSID, channel, encryption, RSSI, vendor, threat flags), GPS fix |
-| **WARSNIFFER** | Frame counters (total / mgmt / ctrl / data / beacon / probe / deauth / EAPOL), AP inventory with client counts, WIDS alert log |
-| **BLUEDRIVER** | BLE device table (address, name, addr type, vendor, RSSI, hit count, advertised service UUIDs) |
+| **WARSNIFFER** | Frame counters (total / mgmt / ctrl / data / beacon / probe / deauth / EAPOL), AP inventory with client counts, WIDS alert log, and **probed SSIDs** (client preferred-network lists harvested passively from directed probe requests) |
+| **BLUEDRIVER** | BLE device table (address, name, addr type, vendor, mfg company ID, RSSI, hit count, advertised service UUIDs). Click a row to queue GATT enumeration; the result renders in the panel below the table |
 
 The dashboard polls `/api/data` every 2 seconds. Toolbar buttons queue
 control commands that are delivered to nodes in the next `/ingest` response.
+
+**CSV export.** Each tab has an `EXPORT CSV` button (and the C2 exposes
+`GET /api/export/wifi`, `/api/export/ble`, `/api/export/sniff`) that streams the
+current aggregate inventory as RFC-4180 CSV for offline reporting.
+
+The C2's in-RAM stores evict least-recently-seen entries once full (so new
+devices keep appearing during long runs), and a `CLEAR` button now also wipes
+the C2's mirror of that node's data — not just the node's own store.
 
 ---
 
@@ -135,7 +157,11 @@ All three nodes POST `application/json` to `http://192.168.4.1/ingest`.
 | `config` | `activeScan:1/0` | BlueDriver: toggle active/passive BLE scan |
 | `config` | `on:<ch>` | WarSniffer: lock to a specific channel |
 | `hop` | `on:1/0` | WarSniffer: enable/disable channel hopping |
-| `gatt` | `mac,addrType` | BlueDriver: connect + enumerate GATT (~8 s) |
+| `gatt` | `mac:"AA:..", addrType:0/1` | BlueDriver: connect + enumerate GATT (~8 s) |
+
+The C2 command queue carries the `gatt` target `mac` + `addrType` through to the
+node (earlier the queue only held `cmd`/`on`, so GATT could not be triggered
+from the dashboard); the BlueDriver tab now issues these by row click.
 
 Commands use monotonic `id`s; nodes ack via `lastCmdId` in subsequent
 requests. The `linkEpoch` / `epoch` mechanism ensures exactly-once delivery
@@ -149,6 +175,9 @@ across reboots of either board.
 - Channel-hop 1–13 in promiscuous mode
 - Count frame types (mgmt / ctrl / data / beacon / probe / deauth / EAPOL)
 - Build AP + client-count inventory from beacon and data frames
+- Harvest directed probe-request SSIDs (the preferred-network lists devices
+  broadcast as they hunt for remembered APs) — useful client profiling, fully
+  passive (it only listens; it never answers a probe)
 - Raise WIDS alerts: deauth flood (>20/s), beacon flood (>40 unique SSIDs/s),
   evil-twin (same SSID, new BSSID, ≥25 dBm RSSI delta)
 - Report metadata only (no raw packet payloads, no handshakes)

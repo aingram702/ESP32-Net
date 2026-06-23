@@ -129,6 +129,7 @@ tr:hover td{background:#07261759}
       <button class="btn" onclick="cmd('wardriver','scan',1)">SCAN ON</button>
       <button class="btn stop" onclick="cmd('wardriver','scan',0)">SCAN OFF</button>
       <button class="btn ghost" onclick="cmd('wardriver','clear')">CLEAR STORE</button>
+      <a class="btn ghost" href="/api/export/wifi" download>EXPORT CSV</a>
       <span class="muted" id="wd-gps">gps: --</span>
     </div>
     <div class="tablewrap"><table>
@@ -144,6 +145,7 @@ tr:hover td{background:#07261759}
       <button class="btn stop" onclick="cmd('warsniffer','scan',0)">CAPTURE OFF</button>
       <button class="btn ghost" onclick="cmd('warsniffer','hop',1)">HOP ON</button>
       <button class="btn ghost" onclick="cmd('warsniffer','clear')">CLEAR</button>
+      <a class="btn ghost" href="/api/export/sniff" download>EXPORT CSV</a>
       <span class="muted" id="ws-meta">ch: -- &nbsp; frames: --</span>
     </div>
     <div class="cards" id="ws-counters"></div>
@@ -157,6 +159,11 @@ tr:hover td{background:#07261759}
       <thead><tr><th>Type</th><th>BSSID</th><th>Detail</th><th>When</th></tr></thead>
       <tbody id="ws-alerts"></tbody>
     </table></div>
+    <h4 class="muted">Probed SSIDs (client preferred-network lists)</h4>
+    <div class="tablewrap" style="max-height:24vh"><table>
+      <thead><tr><th>SSID</th><th>Hits</th><th>Last seen</th></tr></thead>
+      <tbody id="ws-probes"></tbody>
+    </table></div>
   </section>
 
   <!-- BLUEDRIVER -->
@@ -167,11 +174,15 @@ tr:hover td{background:#07261759}
       <button class="btn ghost" onclick="cmd('bluedriver','config',1)">ACTIVE SCAN</button>
       <button class="btn ghost" onclick="cmd('bluedriver','config',0)">PASSIVE</button>
       <button class="btn ghost" onclick="cmd('bluedriver','clear')">CLEAR</button>
+      <a class="btn ghost" href="/api/export/ble" download>EXPORT CSV</a>
+      <span class="muted">GATT: click a row to enqueue enumeration</span>
     </div>
     <div class="tablewrap"><table>
-      <thead><tr><th>Address</th><th>Name</th><th>Type</th><th>Vendor</th><th>RSSI</th><th>Hits</th><th>Services</th></tr></thead>
+      <thead><tr><th>Address</th><th>Name</th><th>Type</th><th>Vendor</th><th>MfgID</th><th>RSSI</th><th>Hits</th><th>Services</th></tr></thead>
       <tbody id="bd-rows"></tbody>
     </table></div>
+    <h4 class="muted">GATT enumeration result</h4>
+    <div class="tablewrap" style="max-height:34vh"><pre id="bd-gatt" style="margin:0;padding:10px;white-space:pre-wrap;color:var(--txt)">no GATT enumeration yet — click a device row above</pre></div>
   </section>
 </main>
 
@@ -266,14 +277,34 @@ function render(d){
     al+='<tr><td><span class="tag crit">'+esc(x.type)+'</span></td><td>'+esc(x.bssid||"")
       +"</td><td>"+esc(x.detail||"")+"</td><td>"+ago(x.ageMs)+"</td></tr>"; });
   document.getElementById("ws-alerts").innerHTML=al||'<tr><td colspan=4 class="empty">no alerts</td></tr>';
+  var pb="";
+  (d.warsniffer.probes||[]).forEach(function(p){
+    pb+="<tr><td>"+esc(p.ssid)+"</td><td>"+p.hits+"</td><td>"+ago(p.seenMs)+"</td></tr>"; });
+  document.getElementById("ws-probes").innerHTML=pb||'<tr><td colspan=3 class="empty">no directed probe requests captured</td></tr>';
 
   // BLUEDRIVER
   var bd="";
   d.bluedriver.devs.forEach(function(v){
-    bd+="<tr><td>"+esc(v.mac)+"</td><td>"+(v.name?esc(v.name):'<span class=muted>--</span>')
-      +"</td><td>"+esc(v.type||"")+"</td><td>"+esc(v.vendor||"")+"</td><td>"+rssiBar(v.rssi)
-      +"</td><td>"+v.hits+"</td><td class='muted'>"+esc(v.services||"")+"</td></tr>"; });
-  document.getElementById("bd-rows").innerHTML=bd||'<tr><td colspan=7 class="empty">no BLE devices yet</td></tr>';
+    var at = (v.type==="random")?1:0;   // addrType: 0=public, 1=random
+    bd+="<tr style='cursor:pointer' title='click to enqueue GATT enumeration' "
+      +"onclick=\"gatt('"+esc(v.mac)+"',"+at+")\"><td>"+esc(v.mac)+"</td><td>"
+      +(v.name?esc(v.name):'<span class=muted>--</span>')
+      +"</td><td>"+esc(v.type||"")+"</td><td>"+esc(v.vendor||"")+"</td><td>"+esc(v.mfgId||"")
+      +"</td><td>"+rssiBar(v.rssi)+"</td><td>"+v.hits+"</td><td class='muted'>"+esc(v.services||"")+"</td></tr>"; });
+  document.getElementById("bd-rows").innerHTML=bd||'<tr><td colspan=8 class="empty">no BLE devices yet</td></tr>';
+
+  // GATT result panel
+  if(d.bluedriver.gatt){
+    document.getElementById("bd-gatt").textContent =
+      "("+ago(d.bluedriver.gattAgeMs)+" ago)\n"+JSON.stringify(d.bluedriver.gatt,null,2);
+  }
+}
+
+// queue a GATT enumeration for a tapped BLE device
+function gatt(mac,addrType){
+  fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({target:"bluedriver",cmd:"gatt",mac:mac,addrType:addrType})}).catch(function(){});
+  document.getElementById("bd-gatt").textContent="GATT enumeration queued for "+mac+" — result appears here in ~10s...";
 }
 
 function poll(){

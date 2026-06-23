@@ -39,5 +39,7 @@
 #define GPS_BAUD           9600
 
 // ---- Onboard WS2812 status LED (DevKitC-1, GPIO48) -------------------------
+// green=scanning+GPS fix, cyan=scanning/no fix, blue=reporting, amber=scan off.
+#define STATUS_LED_ENABLED true
 #define STATUS_LED_PIN     48
-#define LED_BRIGHTNESS     24
+#define LED_BRIGHTNESS     24      // 0-255 master brightness scale

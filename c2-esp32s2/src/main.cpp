@@ -17,6 +17,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <ESPmDNS.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include "config.h"
@@ -43,6 +44,7 @@ struct BLEDev {
   int8_t   rssi      = -128;
   uint16_t hits      = 0;
   char     services[40]={0};
+  char     mfgId[6]  = {0};   // company ID hex, e.g. "004C" (Apple)
   uint32_t seenMs    = 0;
 };
 struct SniffAP {
@@ -59,11 +61,17 @@ struct Alert {
   char     detail[40]= {0};
   uint32_t tMs       = 0;
 };
+struct Probe {                      // directed probe-request SSID (client PNL)
+  char     ssid[33]  = {0};
+  uint16_t hits      = 0;
+  uint32_t seenMs    = 0;
+};
 
 static WiFiAP  g_wifi[MAX_WIFI_APS];   static int g_wifiN  = 0;
 static BLEDev  g_ble [MAX_BLE_DEVS];   static int g_bleN   = 0;
 static SniffAP g_sap [MAX_SNIFF_APS];  static int g_sapN   = 0;
 static Alert   g_alt [MAX_ALERTS];     static int g_altN   = 0;   // ring
+static Probe   g_prb [MAX_PROBES];     static int g_prbN   = 0;
 
 // WarSniffer aggregate counters / state (last reported snapshot)
 struct SniffFrames { uint32_t total,mgmt,ctrl,data,beacon,probe,deauth,eapol; };
@@ -75,10 +83,18 @@ static uint32_t g_sniffDrop = 0;
 struct GpsSnap { bool valid=false; double lat=0, lon=0; int sats=0; };
 static GpsSnap g_gps;
 
+// Last GATT enumeration result reported by the BlueDriver (raw JSON, capped).
+// Surfaced on the dashboard's BlueDriver tab; cleared on a BlueDriver "clear".
+static char     g_gattJson[MAX_GATT_BYTES] = {0};
+static uint32_t g_gattMs = 0;
+
 // ---------------------------------------------------------------------------
 //  Per-node link state + outbound command queue (epoch + monotonic ids)
 // ---------------------------------------------------------------------------
-struct Command { uint32_t id; char cmd[12]; int on; };  // on=-2 => omitted
+// on=-2 => "on" field omitted from the wire reply.
+// arg/arg2 carry string/int operands (currently the GATT target mac + addrType),
+// emitted only when arg[0] != 0 so other commands stay compact.
+struct Command { uint32_t id; char cmd[12]; int on; char arg[20]; int arg2; };
 struct NodeLink {
   bool     ever      = false;
   uint32_t lastSeen  = 0;
@@ -101,7 +117,8 @@ static NodeLink* linkFor(const char* src) {
   return nullptr;
 }
 
-static void enqueueCmd(NodeLink* L, const char* cmd, int on) {
+static void enqueueCmd(NodeLink* L, const char* cmd, int on,
+                       const char* arg = nullptr, int arg2 = 0) {
   if (!L) return;
   if (L->qN >= MAX_CMDS_PER_NODE) {           // drop oldest
     memmove(&L->q[0], &L->q[1], sizeof(Command) * (MAX_CMDS_PER_NODE - 1));
@@ -111,6 +128,9 @@ static void enqueueCmd(NodeLink* L, const char* cmd, int on) {
   c.id = L->nextId++;
   strncpy(c.cmd, cmd, sizeof(c.cmd) - 1); c.cmd[sizeof(c.cmd)-1] = 0;
   c.on = on;
+  if (arg) { strncpy(c.arg, arg, sizeof(c.arg) - 1); c.arg[sizeof(c.arg)-1] = 0; }
+  else     c.arg[0] = 0;
+  c.arg2 = arg2;
 }
 
 // prune commands the node has acked (id <= lastCmdId), but only if its
@@ -131,12 +151,20 @@ static void cpy(char* dst, size_t n, const char* src) {
   strncpy(dst, src, n - 1); dst[n - 1] = 0;
 }
 
+// Pick the slot with the oldest seenMs (LRU victim) once a store is full.
+template <typename T>
+static int oldestSlot(const T* arr, int n) {
+  int v = 0;
+  for (int i = 1; i < n; i++) if (arr[i].seenMs < arr[v].seenMs) v = i;
+  return v;
+}
+
 static void upsertWiFi(JsonObjectConst o) {
   const char* mac = o["mac"] | o["bssid"] | "";
   if (!*mac) return;
   int idx = -1;
   for (int i = 0; i < g_wifiN; i++) if (!strcasecmp(g_wifi[i].mac, mac)) { idx = i; break; }
-  if (idx < 0) { if (g_wifiN >= MAX_WIFI_APS) return; idx = g_wifiN++; }
+  if (idx < 0) idx = (g_wifiN < MAX_WIFI_APS) ? g_wifiN++ : oldestSlot(g_wifi, g_wifiN);
   WiFiAP& a = g_wifi[idx];
   cpy(a.mac, sizeof(a.mac), mac);
   cpy(a.ssid, sizeof(a.ssid), o["ssid"] | "");
@@ -153,7 +181,7 @@ static void upsertBLE(JsonObjectConst o) {
   if (!*mac) return;
   int idx = -1;
   for (int i = 0; i < g_bleN; i++) if (!strcasecmp(g_ble[i].mac, mac)) { idx = i; break; }
-  if (idx < 0) { if (g_bleN >= MAX_BLE_DEVS) return; idx = g_bleN++; }
+  if (idx < 0) idx = (g_bleN < MAX_BLE_DEVS) ? g_bleN++ : oldestSlot(g_ble, g_bleN);
   BLEDev& d = g_ble[idx];
   cpy(d.mac, sizeof(d.mac), mac);
   cpy(d.name, sizeof(d.name), o["name"] | "");
@@ -162,6 +190,7 @@ static void upsertBLE(JsonObjectConst o) {
   d.rssi = o["rssiBest"] | o["rssi"] | (int)-128;
   d.hits = o["count"] | (int)(d.hits + 1);
   cpy(d.services, sizeof(d.services), o["services"] | "");
+  cpy(d.mfgId, sizeof(d.mfgId), o["mfgId"] | "");
   d.seenMs = millis();
 }
 
@@ -170,7 +199,7 @@ static void upsertSniffAP(JsonObjectConst o) {
   if (!*b) return;
   int idx = -1;
   for (int i = 0; i < g_sapN; i++) if (!strcasecmp(g_sap[i].bssid, b)) { idx = i; break; }
-  if (idx < 0) { if (g_sapN >= MAX_SNIFF_APS) return; idx = g_sapN++; }
+  if (idx < 0) idx = (g_sapN < MAX_SNIFF_APS) ? g_sapN++ : oldestSlot(g_sap, g_sapN);
   SniffAP& a = g_sap[idx];
   cpy(a.bssid, sizeof(a.bssid), b);
   cpy(a.ssid, sizeof(a.ssid), o["ssid"] | "");
@@ -186,6 +215,29 @@ static void pushAlert(JsonObjectConst o) {
   cpy(a.bssid, sizeof(a.bssid), o["bssid"] | "");
   cpy(a.detail, sizeof(a.detail), o["detail"] | "");
   a.tMs = millis();
+}
+
+static void upsertProbe(JsonObjectConst o) {
+  const char* ssid = o["ssid"] | "";
+  if (!*ssid) return;
+  int idx = -1;
+  for (int i = 0; i < g_prbN; i++) if (!strcmp(g_prb[i].ssid, ssid)) { idx = i; break; }
+  if (idx < 0) idx = (g_prbN < MAX_PROBES) ? g_prbN++ : oldestSlot(g_prb, g_prbN);
+  Probe& p = g_prb[idx];
+  cpy(p.ssid, sizeof(p.ssid), ssid);
+  p.hits   = o["hits"] | (int)(p.hits + 1);
+  p.seenMs = millis();
+}
+
+// Mirror the operator's per-node "clear" on the C2's own aggregate store, so a
+// CLEAR button empties the dashboard immediately instead of showing stale data
+// that the (now-empty) node will never re-report.
+static void clearMirror(const char* target) {
+  if (!strcmp(target, "wardriver"))  { g_wifiN = 0; g_gps = GpsSnap(); }
+  else if (!strcmp(target, "bluedriver")) { g_bleN = 0; g_gattJson[0] = 0; g_gattMs = 0; }
+  else if (!strcmp(target, "warsniffer")) {
+    g_sapN = 0; g_altN = 0; g_prbN = 0; g_frames = SniffFrames{0}; g_sniffDrop = 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +258,7 @@ static void buildIngestReply(NodeLink* L, String& out) {
     c["id"]  = L->q[i].id;
     c["cmd"] = L->q[i].cmd;
     if (L->q[i].on != -2) c["on"] = L->q[i].on;
+    if (L->q[i].arg[0]) { c["mac"] = L->q[i].arg; c["addrType"] = L->q[i].arg2; }
   }
   serializeJson(doc, out);
 }
@@ -244,6 +297,12 @@ static void handleIngestBody(AsyncWebServerRequest* req) {
              (unsigned)g_wifiN, (int)(st["scanning"] | 0));
   } else if (L == &L_bd) {
     for (JsonObjectConst o : doc["devices"].as<JsonArrayConst>()) upsertBLE(o);
+    JsonObjectConst gr = doc["gattResult"];
+    if (!gr.isNull()) {
+      size_t w = serializeJson(gr, g_gattJson, sizeof(g_gattJson));
+      if (w == 0 || w >= sizeof(g_gattJson)) g_gattJson[0] = 0;  // dropped if too big
+      else g_gattMs = millis();
+    }
     snprintf(L->detail, sizeof(L->detail), "%u dev / active:%d",
              (unsigned)g_bleN, (int)(st["activeScan"] | 0));
   } else if (L == &L_ws) {
@@ -257,6 +316,7 @@ static void handleIngestBody(AsyncWebServerRequest* req) {
     g_sniffDrop = st["dropped"] | 0;
     for (JsonObjectConst o : doc["aps"].as<JsonArrayConst>())    upsertSniffAP(o);
     for (JsonObjectConst o : doc["alerts"].as<JsonArrayConst>()) pushAlert(o);
+    for (JsonObjectConst o : doc["probes"].as<JsonArrayConst>()) upsertProbe(o);
     snprintf(L->detail, sizeof(L->detail), "ch%u / %u frames",
              (unsigned)g_sniffCh, (unsigned)g_frames.total);
   }
@@ -284,8 +344,81 @@ static void handleCmdBody(AsyncWebServerRequest* req) {
   else if (!strcmp(target, "bluedriver")) L = &L_bd;
   if (!L || !*cmd) { req->send(400, "text/plain", "bad target/cmd"); return; }
 
-  enqueueCmd(L, cmd, on);
+  if (!strcmp(cmd, "gatt")) {                        // gatt carries mac + addrType
+    const char* mac = doc["mac"] | "";
+    if (!*mac) { req->send(400, "text/plain", "gatt needs mac"); return; }
+    enqueueCmd(L, cmd, on, mac, doc["addrType"] | 0);
+  } else {
+    enqueueCmd(L, cmd, on);
+  }
+  if (!strcmp(cmd, "clear")) clearMirror(target);   // keep the dashboard in sync
   req->send(200, "application/json", "{\"ok\":1}");
+}
+
+// ---------------------------------------------------------------------------
+//  CSV export — pull collected inventory off the C2 for offline reporting.
+//  GET /api/export/wifi | /api/export/ble | /api/export/sniff
+// ---------------------------------------------------------------------------
+// RFC-4180 minimal CSV field: quote if it contains a comma, quote or newline,
+// and double any embedded quotes.
+static void csvField(AsyncResponseStream* rs, const char* s) {
+  if (!s) s = "";
+  bool quote = false;
+  for (const char* p = s; *p; p++) if (*p==',' || *p=='"' || *p=='\n' || *p=='\r') { quote = true; break; }
+  if (!quote) { rs->print(s); return; }
+  rs->print('"');
+  for (const char* p = s; *p; p++) { if (*p=='"') rs->print('"'); rs->print(*p); }
+  rs->print('"');
+}
+
+static void handleExportWiFi(AsyncWebServerRequest* req) {
+  AsyncResponseStream* rs = req->beginResponseStream("text/csv");
+  rs->addHeader("Content-Disposition", "attachment; filename=wifi.csv");
+  rs->print("BSSID,SSID,Channel,Encryption,RSSI,Vendor,Flag,AgeSec\n");
+  uint32_t now = millis();
+  for (int i = 0; i < g_wifiN; i++) {
+    csvField(rs, g_wifi[i].mac);  rs->print(',');
+    csvField(rs, g_wifi[i].ssid); rs->print(',');
+    rs->printf("%u,", (unsigned)g_wifi[i].ch);
+    csvField(rs, g_wifi[i].enc);  rs->print(',');
+    rs->printf("%d,", (int)g_wifi[i].rssi);
+    csvField(rs, g_wifi[i].vendor); rs->print(',');
+    csvField(rs, g_wifi[i].flag);   rs->print(',');
+    rs->printf("%u\n", (unsigned)((now - g_wifi[i].seenMs) / 1000));
+  }
+  req->send(rs);
+}
+
+static void handleExportBLE(AsyncWebServerRequest* req) {
+  AsyncResponseStream* rs = req->beginResponseStream("text/csv");
+  rs->addHeader("Content-Disposition", "attachment; filename=ble.csv");
+  rs->print("Address,Name,AddrType,Vendor,MfgId,RSSI,Hits,Services,AgeSec\n");
+  uint32_t now = millis();
+  for (int i = 0; i < g_bleN; i++) {
+    csvField(rs, g_ble[i].mac);  rs->print(',');
+    csvField(rs, g_ble[i].name); rs->print(',');
+    csvField(rs, g_ble[i].type); rs->print(',');
+    csvField(rs, g_ble[i].vendor); rs->print(',');
+    csvField(rs, g_ble[i].mfgId);  rs->print(',');
+    rs->printf("%d,%u,", (int)g_ble[i].rssi, (unsigned)g_ble[i].hits);
+    csvField(rs, g_ble[i].services); rs->print(',');
+    rs->printf("%u\n", (unsigned)((now - g_ble[i].seenMs) / 1000));
+  }
+  req->send(rs);
+}
+
+static void handleExportSniff(AsyncWebServerRequest* req) {
+  AsyncResponseStream* rs = req->beginResponseStream("text/csv");
+  rs->addHeader("Content-Disposition", "attachment; filename=sniff.csv");
+  rs->print("BSSID,SSID,Channel,RSSI,Clients,AgeSec\n");
+  uint32_t now = millis();
+  for (int i = 0; i < g_sapN; i++) {
+    csvField(rs, g_sap[i].bssid); rs->print(',');
+    csvField(rs, g_sap[i].ssid);  rs->print(',');
+    rs->printf("%u,%d,%u,", (unsigned)g_sap[i].ch, (int)g_sap[i].rssi, (unsigned)g_sap[i].clients);
+    rs->printf("%u\n", (unsigned)((now - g_sap[i].seenMs) / 1000));
+  }
+  req->send(rs);
 }
 
 // /api/data : full snapshot for the dashboard
@@ -343,6 +476,11 @@ static void handleData(AsyncWebServerRequest* req) {
     a["type"]=g_alt[i].type; a["bssid"]=g_alt[i].bssid;
     a["detail"]=g_alt[i].detail; a["ageMs"]= now - g_alt[i].tMs;
   }
+  JsonArray pb = ws["probes"].to<JsonArray>();
+  for (int i = 0; i < g_prbN; i++) {
+    JsonObject p = pb.add<JsonObject>();
+    p["ssid"]=g_prb[i].ssid; p["hits"]=g_prb[i].hits; p["seenMs"]= now - g_prb[i].seenMs;
+  }
 
   // BLUEDRIVER
   JsonObject bd = doc["bluedriver"].to<JsonObject>();
@@ -352,6 +490,14 @@ static void handleData(AsyncWebServerRequest* req) {
     d["mac"]=g_ble[i].mac; d["name"]=g_ble[i].name; d["type"]=g_ble[i].type;
     d["vendor"]=g_ble[i].vendor; d["rssi"]=g_ble[i].rssi; d["hits"]=g_ble[i].hits;
     d["services"]=g_ble[i].services;
+    if (g_ble[i].mfgId[0]) d["mfgId"]=g_ble[i].mfgId;
+  }
+  if (g_gattJson[0]) {
+    JsonDocument gd;                          // nest the captured GATT result
+    if (!deserializeJson(gd, g_gattJson)) {
+      bd["gatt"] = gd.as<JsonObject>();
+      bd["gattAgeMs"] = now - g_gattMs;
+    }
   }
 
   AsyncResponseStream* rs = req->beginResponseStream("application/json");
@@ -397,12 +543,20 @@ void setup() {
 
   startAP();
 
+  if (MDNS.begin(MDNS_HOST)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("[C2] mDNS responder up: http://%s.local/\n", MDNS_HOST);
+  }
+
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
     AsyncWebServerResponse* resp = r->beginResponse_P(200, "text/html", INDEX_HTML);
     resp->addHeader("Cache-Control", "no-store");
     r->send(resp);
   });
   server.on("/api/data", HTTP_GET, handleData);
+  server.on("/api/export/wifi",  HTTP_GET, handleExportWiFi);
+  server.on("/api/export/ble",   HTTP_GET, handleExportBLE);
+  server.on("/api/export/sniff", HTTP_GET, handleExportSniff);
   server.on(INGEST_PATH, HTTP_POST, handleIngestBody, nullptr, bodyCollector);
   server.on("/api/cmd", HTTP_POST, handleCmdBody, nullptr, bodyCollector);
 
