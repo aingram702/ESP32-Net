@@ -71,6 +71,18 @@ static String g_gattResult = "";
 static bool   g_gattResultReady = false;
 
 // ---------------------------------------------------------------------------
+//  Status LED (onboard WS2812). neopixelWrite() ships with the Arduino-ESP32
+//  core — no extra library dependency.
+// ---------------------------------------------------------------------------
+static inline void setLed(uint8_t r, uint8_t g, uint8_t b) {
+  if (!STATUS_LED_ENABLED) return;
+  neopixelWrite(STATUS_LED_PIN,
+                (uint16_t)r * LED_BRIGHTNESS / 255,
+                (uint16_t)g * LED_BRIGHTNESS / 255,
+                (uint16_t)b * LED_BRIGHTNESS / 255);
+}
+
+// ---------------------------------------------------------------------------
 //  Vendor OUI hint (public addresses only; random addresses are flagged)
 // ---------------------------------------------------------------------------
 static void vendorHint(const char* macStr, bool isRandom, char* out, size_t n) {
@@ -133,17 +145,16 @@ public:
   void onResult(const NimBLEAdvertisedDevice* d) override {
     if (!g_scanning) return;
 
-    // Normalise MAC to uppercase "AA:BB:CC:DD:EE:FF"
+    // Normalise MAC to uppercase "AA:BB:CC:DD:EE:FF". NimBLE returns it lower-
+    // case ("aa:bb:cc:dd:ee:ff"); parse the hex and re-print uppercase.
     std::string rawMac = d->getAddress().toString();
     char mac[18];
-    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-             (uint8_t)rawMac[0], (uint8_t)rawMac[3], (uint8_t)rawMac[6],
-             (uint8_t)rawMac[9], (uint8_t)rawMac[12],(uint8_t)rawMac[15]);
-    // Parse hex from string instead — rawMac is "aa:bb:cc:dd:ee:ff"
     unsigned a,b,c,dd,m4,f;
     if (sscanf(rawMac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x",
                &a,&b,&c,&dd,&m4,&f) == 6) {
-      snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",a,b,c,dd,m4,f);
+      snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", a,b,c,dd,m4,f);
+    } else {
+      strncpy(mac, rawMac.c_str(), sizeof(mac)-1); mac[sizeof(mac)-1] = 0;
     }
 
     int8_t rssi = (int8_t) d->getRSSI();
@@ -480,6 +491,7 @@ void setup() {
   delay(300);
   Serial.printf("\nESP32-BlueDriver node booting  ver=%s\n", FW_VERSION);
   g_bootMs = millis();
+  setLed(0, 0, 16);                         // boot: dim blue
 
   g_storeMtx = xSemaphoreCreateMutex();
 
@@ -510,12 +522,14 @@ void loop() {
   // ---- Periodic report ---------------------------------------------------
   if (millis() - tReport >= REPORT_INTERVAL_MS) {
     tReport = millis();
+    setLed(0, 0, 48);                       // blue: associating + POSTing
     reportToC2();
   }
 
   // ---- Pending GATT job --------------------------------------------------
   if (g_gattJob.pending) {
     g_gattJob.pending = false;
+    setLed(40, 0, 48);                       // purple: GATT enumeration running
     Serial.printf("[BD] GATT enum -> %s (type %u)\n", g_gattJob.mac, g_gattJob.addrType);
     String res = doGatt(g_gattJob.mac, g_gattJob.addrType);
     Serial.printf("[BD] GATT result: %s\n", res.c_str());
@@ -524,6 +538,9 @@ void loop() {
     // Result ships in the very next reportToC2()
     tReport = 0;   // force an immediate report cycle
   }
+
+  // idle status colour: green when scanning, amber when paused
+  setLed(g_scanning ? 0 : 8, g_scanning ? 48 : 4, 0);
 
   // ---- Heartbeat ---------------------------------------------------------
   if (millis() - tHb >= 3000) {

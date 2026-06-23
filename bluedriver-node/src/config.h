@@ -37,5 +37,7 @@
 #define SCAN_WINDOW     80         //  same as interval = 100% duty-cycle while timeslot is ours
 
 // ---- Onboard WS2812 status LED (DevKitC-1, GPIO48) -------------------------
+// green=scanning, blue=reporting, purple=GATT enum in progress, amber=scan off.
+#define STATUS_LED_ENABLED true
 #define STATUS_LED_PIN  48
-#define LED_BRIGHTNESS  24
+#define LED_BRIGHTNESS  24         // 0-255 master brightness scale

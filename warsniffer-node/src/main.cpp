@@ -35,10 +35,14 @@ struct ApInfo {
 };
 struct StaInfo { uint8_t mac[6]; int apIdx; bool used; };
 struct AlertRec { char type[16]; uint8_t bssid[6]; char detail[40]; uint32_t tMs; };
+// Directed probe-request SSIDs — a client's preferred-network list (PNL). Purely
+// passive: these are SSIDs nearby devices actively broadcast that they remember.
+struct ProbeReq { char ssid[33]; uint16_t hits; uint32_t lastMs; bool used; };
 
 static ApInfo   g_aps[MAX_APS];
 static StaInfo  g_stas[MAX_STAS]; static int g_staN = 0;
 static AlertRec g_alerts[MAX_ALERTS]; static int g_alertHead = 0, g_alertCnt = 0;
+static ProbeReq g_probes[MAX_PROBES]; static int g_probeN = 0;
 
 static volatile uint32_t cTotal=0,cMgmt=0,cCtrl=0,cData=0,
                          cBeacon=0,cProbe=0,cDeauth=0,cEapol=0,cDropped=0;
@@ -68,6 +72,34 @@ static inline bool macEq(const uint8_t* a, const uint8_t* b) {
 }
 static void macStr(const uint8_t* m, char* out) {
   snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", m[0],m[1],m[2],m[3],m[4],m[5]);
+}
+
+// Record a directed probe-request SSID (caller holds g_mux). Bounded inventory:
+// dedupe by SSID, drop silently once full.
+static void noteProbe(const char* ssid) {
+  if (!ssid || !*ssid) return;                 // ignore wildcard/broadcast probes
+  for (int i = 0; i < g_probeN; i++)
+    if (!strcmp(g_probes[i].ssid, ssid)) {
+      if (g_probes[i].hits < 0xFFFF) g_probes[i].hits++;
+      g_probes[i].lastMs = millis();
+      return;
+    }
+  if (g_probeN >= MAX_PROBES) return;
+  ProbeReq& p = g_probes[g_probeN++];
+  strncpy(p.ssid, ssid, sizeof(p.ssid)-1); p.ssid[sizeof(p.ssid)-1]=0;
+  p.hits = 1; p.lastMs = millis(); p.used = true;
+}
+
+// ---------------------------------------------------------------------------
+//  Status LED (onboard WS2812 on the DevKitC-1). neopixelWrite() is built into
+//  the Arduino-ESP32 core — no extra library dependency.
+// ---------------------------------------------------------------------------
+static inline void setLed(uint8_t r, uint8_t g, uint8_t b) {
+  if (!STATUS_LED_ENABLED) return;
+  neopixelWrite(STATUS_LED_PIN,
+                (uint16_t)r * LED_BRIGHTNESS / 255,
+                (uint16_t)g * LED_BRIGHTNESS / 255,
+                (uint16_t)b * LED_BRIGHTNESS / 255);
 }
 
 static int findOrAddAp(const uint8_t* bssid) {
@@ -101,8 +133,6 @@ static void noteClient(const uint8_t* sta, int apIdx) {
 }
 
 static void addAlert(const char* type, const uint8_t* bssid, const char* detail) {
-  AlertRec& a = g_alerts[(g_alertHead + g_alertCnt) % MAX_ALERTS >= 0
-                         ? (g_alertHead + g_alertCnt) % MAX_ALERTS : 0];
   int slot = (g_alertHead + g_alertCnt) % MAX_ALERTS;
   AlertRec& r = g_alerts[slot];
   strncpy(r.type, type, sizeof(r.type)-1); r.type[sizeof(r.type)-1]=0;
@@ -110,7 +140,7 @@ static void addAlert(const char* type, const uint8_t* bssid, const char* detail)
   strncpy(r.detail, detail, sizeof(r.detail)-1); r.detail[sizeof(r.detail)-1]=0;
   r.tMs = millis();
   if (g_alertCnt < MAX_ALERTS) g_alertCnt++;
-  else g_alertHead = (g_alertHead + 1) % MAX_ALERTS;
+  else g_alertHead = (g_alertHead + 1) % MAX_ALERTS;   // overwrite oldest
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +208,14 @@ static void IRAM_ATTR sniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
         if (ai >= 0) { g_aps[ai].ch = ch; g_aps[ai].rssiLast = rssi; g_aps[ai].lastMs = millis(); } }
     } else if (fsubtype == 4) {     // probe request (from a STA)
       cProbe++;
+      // SSID is the first tagged param: header(24) -> [id=0][len][ssid...]
+      if (len > 26 && p[24] == 0x00) {
+        uint8_t sl = p[25];
+        if (sl > 0 && sl <= 32 && 26 + sl <= len) {
+          char tmp[33]; memcpy(tmp, p + 26, sl); tmp[sl] = 0;
+          noteProbe(tmp);
+        }
+      }
     } else if (fsubtype == 12 || fsubtype == 10) {  // deauth / disassoc
       cDeauth++; deauthInWin++;
       if (deauthInWin == DEAUTH_THRESHOLD && addr2) {
@@ -243,6 +281,7 @@ static void clearStore() {
   g_staN = 0;
   for (int i = 0; i < MAX_STAS; i++) g_stas[i].used = false;
   g_alertHead = g_alertCnt = 0;
+  g_probeN = 0;
   cTotal=cMgmt=cCtrl=cData=cBeacon=cProbe=cDeauth=cEapol=cDropped=0;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -318,6 +357,19 @@ static void reportToC2() {
     JsonObject a = al.add<JsonObject>();
     a["type"]=g_alerts[idx].type; a["bssid"]=mac; a["detail"]=g_alerts[idx].detail;
   }
+  // probed SSIDs (client PNLs) — most-recently-seen first, capped
+  JsonArray pr = doc["probes"].to<JsonArray>();
+  bool pTaken[MAX_PROBES] = {false};
+  for (int n = 0; n < UPLINK_PROBE_MAX; n++) {
+    int best = -1; uint32_t bestT = 0;
+    for (int i = 0; i < g_probeN; i++)
+      if (g_probes[i].used && !pTaken[i] && (best < 0 || g_probes[i].lastMs >= bestT))
+        { bestT = g_probes[i].lastMs; best = i; }
+    if (best < 0) break;
+    pTaken[best] = true;
+    JsonObject po = pr.add<JsonObject>();
+    po["ssid"] = g_probes[best].ssid; po["hits"] = g_probes[best].hits;
+  }
   doc["count"] = aps.size();
   portEXIT_CRITICAL(&g_mux);
 
@@ -352,6 +404,7 @@ void setup() {
   delay(300);
   Serial.println("\nESP32-WarSniffer node booting (passive monitor + WIDS)...");
   g_bootMs = millis();
+  setLed(0, 0, 16);                 // boot: dim blue
   WiFi.persistent(false);
   startSniffer();
 }
@@ -360,6 +413,12 @@ void loop() {
   // ---- SNIFF phase ----
   uint32_t phaseStart = millis();
   uint32_t lastHop = millis();
+  // green while sniffing, red if a WIDS alert fired in the last few seconds
+  bool recentAlert = g_alertCnt > 0 &&
+                     (millis() - g_alerts[(g_alertHead + g_alertCnt - 1) % MAX_ALERTS].tMs) < 4000;
+  if (!g_capturing)      setLed(8, 4, 0);     // dim amber: capture stopped
+  else if (recentAlert)  setLed(64, 0, 0);    // red: recent WIDS alert
+  else                   setLed(0, 48, 0);     // green: actively sniffing
   while (millis() - phaseStart < SNIFF_WINDOW_MS) {
     if (g_capturing && g_hop && millis() - lastHop >= HOP_INTERVAL_MS) {
       g_channel++; if (g_channel > CHANNEL_MAX) g_channel = CHANNEL_MIN;
@@ -370,6 +429,7 @@ void loop() {
     delay(5);
   }
   // ---- REPORT phase ----
+  setLed(0, 0, 48);                            // blue: associating + POSTing
   reportToC2();
 
   static uint32_t hb = 0;

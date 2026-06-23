@@ -40,6 +40,18 @@ static ApEntry g_aps[MAX_APS];
 static int     g_apN = 0;
 
 // ---------------------------------------------------------------------------
+//  Status LED (onboard WS2812). neopixelWrite() ships with the Arduino-ESP32
+//  core — no extra library dependency.
+// ---------------------------------------------------------------------------
+static inline void setLed(uint8_t r, uint8_t g, uint8_t b) {
+  if (!STATUS_LED_ENABLED) return;
+  neopixelWrite(STATUS_LED_PIN,
+                (uint16_t)r * LED_BRIGHTNESS / 255,
+                (uint16_t)g * LED_BRIGHTNESS / 255,
+                (uint16_t)b * LED_BRIGHTNESS / 255);
+}
+
+// ---------------------------------------------------------------------------
 //  GPS
 // ---------------------------------------------------------------------------
 static TinyGPSPlus gps;
@@ -128,13 +140,31 @@ static void ensureLogHeader() {
   f.close();
 }
 static int chanToFreq(int ch) { return (ch >= 1 && ch <= 13) ? 2407 + ch * 5 : (ch == 14 ? 2484 : 0); }
+// RFC-4180 CSV field: quote when the value contains a comma, quote or newline,
+// doubling any embedded quotes. Prevents an SSID with a comma from shifting
+// every downstream column (corrupting the WigleWifi export).
+static void csvQuote(const char* s, char* out, size_t n) {
+  bool needQuote = false;
+  for (const char* p = s; *p; p++) if (*p==',' || *p=='"' || *p=='\n' || *p=='\r') { needQuote = true; break; }
+  if (!needQuote) { strncpy(out, s, n-1); out[n-1] = 0; return; }
+  size_t w = 0;
+  if (w < n-1) out[w++] = '"';
+  for (const char* p = s; *p && w < n-2; p++) {
+    if (*p=='"' && w < n-3) out[w++] = '"';   // escape by doubling
+    out[w++] = *p;
+  }
+  if (w < n-1) out[w++] = '"';
+  out[w] = 0;
+}
 static void logRow(const ApEntry& e) {
   if (!g_fsOk || !LOG_TO_FLASH) return;
   File f = LittleFS.open(WIFI_LOG_PATH, "a");
   if (!f) return;
   if (f.size() > LOG_MAX_BYTES) { f.close(); return; }   // stop growing
+  char ssidQ[68];
+  csvQuote(e.ssid, ssidQ, sizeof(ssidQ));
   f.printf("%s,%s,[%s],%s,%d,%d,%d,%.6f,%.6f,0,%s,WIFI\n",
-           e.bssid, e.ssid, e.enc, e.firstSeen, e.ch, chanToFreq(e.ch),
+           e.bssid, ssidQ, e.enc, e.firstSeen, e.ch, chanToFreq(e.ch),
            e.rssiBest, e.lat, e.lon, e.hasGps ? "5" : "0");
   f.close();
 }
@@ -183,7 +213,9 @@ static void doScan() {
     int r = WiFi.RSSI(i);
     if (r > e.rssiBest) { e.rssiBest = r;
       if (g_gps.valid) { e.lat = g_gps.lat; e.lon = g_gps.lon; e.hasGps = true; } }
-    if (!e.logged) { logRow(e); e.logged = true; }
+    // Defer the CSV row until we have a GPS-stamped position, so the WigleWifi
+    // export doesn't fill with worthless 0,0 coordinates before the first fix.
+    if (!e.logged && e.hasGps) { logRow(e); e.logged = true; }
   }
   WiFi.scanDelete();
 }
@@ -279,6 +311,7 @@ void setup() {
   delay(300);
   Serial.println("\nESP32-WarDriver node booting (scan + GPS + log)...");
   g_bootMs = millis();
+  setLed(0, 0, 16);                            // boot: dim blue
 
   g_fsOk = LittleFS.begin(true);
   if (g_fsOk) ensureLogHeader();
@@ -296,7 +329,16 @@ void loop() {
   pumpGps();
 
   if (millis() - tScan >= SCAN_INTERVAL_MS) { tScan = millis(); doScan(); }
-  if (millis() - tReport >= REPORT_INTERVAL_MS) { tReport = millis(); reportToC2(); }
+  if (millis() - tReport >= REPORT_INTERVAL_MS) {
+    tReport = millis();
+    setLed(0, 0, 48);                          // blue: associating + POSTing
+    reportToC2();
+  }
+
+  // idle status colour between report bursts
+  if (!g_scanning)        setLed(8, 4, 0);     // amber: scan paused
+  else if (g_gps.valid)   setLed(0, 48, 0);     // green: scanning with GPS fix
+  else                    setLed(0, 24, 24);    // cyan: scanning, no fix yet
 
   static uint32_t hb = 0;
   if (millis() - hb > 2000) {

@@ -19,10 +19,18 @@
 #define MAX_BLE_DEVS    128           // BlueDriver inventory
 #define MAX_SNIFF_APS    96           // WarSniffer AP inventory
 #define MAX_ALERTS       48           // WarSniffer WIDS alerts (rolling)
+#define MAX_PROBES       64           // WarSniffer probed SSIDs (client PNLs)
 #define MAX_CMDS_PER_NODE 8           // queued control commands per node
 
 // A node is shown "offline" if it hasn't POSTed within this window.
 #define NODE_TIMEOUT_MS  15000
+
+// Cap on the stored GATT enumeration result (bytes). Keeps S2 heap bounded.
+#define MAX_GATT_BYTES   2048
+
+// ---- mDNS ------------------------------------------------------------------
+// Browse to http://esp32net.local/ instead of the IP (where mDNS is supported).
+#define MDNS_HOST      "esp32net"
 
 // ---- Firmware identity -----------------------------------------------------
 #define FW_NAME    "ESP32-Net C2"
