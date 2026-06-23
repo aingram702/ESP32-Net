@@ -1,0 +1,321 @@
+.\" Manpage for the ESP32-Net toolkit.
+.\" View with:  man ./docs/esp32-net.7
+.\" Install with: cp docs/esp32-net.7 /usr/local/share/man/man7/ && mandb
+.TH ESP32-NET 7 "2026-06-23" "ESP32-Net 1.0.0" "ESP32-Net Toolkit Manual"
+.SH NAME
+esp32\-net \- four\-device passive wireless reconnaissance and WIDS toolkit
+.SH SYNOPSIS
+.nf
+.B esp32\-net
+is a firmware suite, not a host command. Each component is flashed to an
+ESP32 board with PlatformIO and operated over WiFi from a browser:
+
+  pio run -t upload        \fR# build + flash the project in the current dir\fP
+  pio device monitor       \fR# 115200 baud serial console\fP
+
+  c2-esp32s2/              \fR# coordinator: SoftAP + dashboard\fP
+  wardriver-node/          \fR# WiFi survey + GPS + WigleWifi CSV\fP
+  warsniffer-node/         \fR# passive 802.11 monitor + WIDS\fP
+  bluedriver-node/         \fR# BLE scanner + GATT enumeration\fP
+
+Dashboard: \fBhttp://192.168.4.1/\fP  (or \fBhttp://esp32net.local/\fP via mDNS)
+.fi
+.SH DESCRIPTION
+.B ESP32\-Net
+is a distributed, passive wireless reconnaissance and wireless intrusion
+detection (WIDS) toolkit built from four ESP32 boards. One coordinator
+("C2") hosts a WiFi access point and a web dashboard; three headless scan
+nodes join that access point and stream JSON metadata to it on a timer.
+.PP
+The toolkit is intended for authorized homelab experiments and penetration
+testing engagements. At the radio layer it transmits only what a normal WiFi
+scan or BLE scan emits (active-scan probe requests; optional BLE scan
+requests) and, on request, a single GATT client connection. It never
+deauthenticates clients, injects frames, stands up rogue access points, or
+stores raw packet payloads or WPA handshakes. See
+.B SECURITY AND LEGAL
+below.
+.SS Architecture
+The three scan nodes (the "S3 nodes") are headless: no display and no local
+web UI. They associate to the coordinator's SoftAP, named
+.B ESP32-NET
+by default, and HTTP POST a compact JSON snapshot to the coordinator's
+.B /ingest
+endpoint every few seconds. The coordinator keeps a capped in\-RAM inventory,
+aggregates all node data, serves a four\-tab dashboard, and relays operator
+control commands back to nodes inside each ingest response.
+.PP
+.nf
+   [WarDriver]  [WarSniffer]  [BlueDriver]   <- ESP32-S3 nodes (headless)
+        \\            |             /
+         \\           |            /   WiFi STA, POST /ingest (JSON)
+          \\          |           /
+            [  C2 coordinator  ]          <- ESP32-S2, SoftAP "ESP32-NET"
+                    |
+              HTTP :80 dashboard          <- browser at 192.168.4.1
+.fi
+.SH COMPONENTS
+.TP
+.B c2-esp32s2
+The coordinator. Target board: ESP32\-S2 (e.g. the Flipper Zero "WiFi Dev
+Board", an ESP32\-S2\-WROVER). Hosts the SoftAP, ingests node JSON, holds the
+aggregate inventory, serves the dashboard and the
+.B /api/*
+endpoints, and queues control commands. No scanning hardware of its own.
+.TP
+.B wardriver-node
+WiFi survey node. Target: ESP32\-S3\-DevKitC\-1 (N16R8). Runs active WiFi scans,
+stamps results with a NEO\-6M GPS fix, writes a WigleWifi\-1.4 CSV to LittleFS,
+and flags surveillance/rogue patterns (heuristic). Reports newly\-seen networks
+to the coordinator.
+.TP
+.B warsniffer-node
+Passive 802.11 monitor + WIDS. Target: ESP32\-S3\-DevKitC\-1 (N16R8). Channel\-hops
+1\(en13 in promiscuous mode, tallies frame types, builds an AP/STA inventory,
+harvests directed probe\-request SSIDs (client preferred\-network lists), and
+raises deauth\-flood, beacon\-flood, and evil\-twin detections. Reports metadata
+only.
+.TP
+.B bluedriver-node
+BLE scanner. Target: ESP32\-S3\-DevKitC\-1 (N16R8). Continuous passive or active
+BLE advertisement scan via NimBLE v2.x, with per\-device inventory and on\-demand
+GATT service/characteristic enumeration. BLE 5.0 only \(em the ESP32\-S3 has no
+Bluetooth Classic.
+.SH BUILDING AND FLASHING
+Each component directory is a self\-contained PlatformIO project. From a
+directory:
+.PP
+.nf
+   pio pkg install          # pull library dependencies (first time)
+   pio run                  # compile only
+   pio run -t upload        # compile + flash over USB
+   pio run -t uploadfs      # flash the LittleFS data partition
+   pio device monitor       # serial console at 115200 baud
+.fi
+.PP
+Flash the coordinator first so its SoftAP exists before the nodes try to
+associate. Order between the three nodes does not matter.
+.SH CONFIGURATION
+Compile\-time settings live in each project's
+.B src/config.h
+and must be edited before flashing. Key values:
+.TP
+.B AP_SSID, AP_PASSWORD
+Coordinator SoftAP credentials (\fBc2-esp32s2/src/config.h\fP). The matching
+.B C2_SSID
+/
+.B C2_PASSWORD
+in every node config must agree. Defaults are
+.B ESP32-NET
+/
+.BR dropnetc2! .
+.B Change these before any field use.
+.TP
+.B GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD
+WarDriver UART pins for the NEO\-6M GPS (default RX 18, TX 17, 9600 baud).
+.TP
+.B CHANNEL_MIN, CHANNEL_MAX, HOP_INTERVAL_MS
+WarSniffer channel\-hop range and dwell time. Set
+.B CHANNEL_MAX
+to 14 only where legally permitted.
+.TP
+.B DEAUTH_THRESHOLD, BEACON_FLOOD_THRESHOLD, EVIL_TWIN_RSSI_DELTA
+WarSniffer WIDS detection thresholds.
+.TP
+.B DEFAULT_ACTIVE_SCAN
+BlueDriver scan mode at boot: active (sends scan requests, richer data) or
+passive (listen only, stealthier).
+.TP
+.B STATUS_LED_ENABLED, STATUS_LED_PIN, LED_BRIGHTNESS
+Onboard WS2812 status LED on each node (GPIO 48 on the DevKitC\-1). Set
+.B STATUS_LED_ENABLED
+to false to disable.
+.SH DASHBOARD
+The coordinator serves a single\-page dashboard with one tab per node. It polls
+.B /api/data
+every two seconds and renders live tables; toolbar buttons issue control
+commands. Tabs:
+.TP
+.B OVERVIEW
+Per\-node online/offline state, uptime, free heap, and aggregate counts.
+.TP
+.B WARDRIVER
+Scanned AP table (BSSID, SSID, channel, encryption, RSSI, vendor, threat flag)
+and the current GPS fix.
+.TP
+.B WARSNIFFER
+Frame\-type counters, AP/STA inventory with client counts, the WIDS alert log,
+and the harvested probe\-request SSID list.
+.TP
+.B BLUEDRIVER
+BLE device table (address, name, address type, vendor, manufacturer company ID,
+RSSI, hit count, service UUIDs). Click a device row to queue GATT enumeration;
+the result renders in the panel below the table.
+.SH STATUS LEDS
+Each headless node drives its onboard WS2812 so its state is readable without a
+serial console:
+.PP
+.nf
+   COLOUR   WARDRIVER           WARSNIFFER          BLUEDRIVER
+   green    scanning, GPS fix   sniffing            scanning
+   cyan     scanning, no fix    -                   -
+   blue     reporting to C2     reporting to C2     reporting to C2
+   purple   -                   -                   GATT enum running
+   red      -                   recent WIDS alert   -
+   amber    scan paused         capture stopped     scan paused
+.fi
+.SH HTTP API
+Served by the coordinator on port 80.
+.TP
+.B GET /
+The dashboard (HTML).
+.TP
+.B GET /api/data
+Full aggregate snapshot as JSON; polled by the dashboard.
+.TP
+.B POST /api/cmd
+Queue a control command. Body:
+.BR {"target":"wardriver|warsniffer|bluedriver","cmd":"...","on":N} .
+The
+.B gatt
+command additionally takes
+.B mac
+and
+.BR addrType .
+.TP
+.B GET /api/export/wifi, /api/export/ble, /api/export/sniff
+Stream the current inventory as RFC\-4180 CSV (with a
+.B Content-Disposition
+attachment header) for offline reporting.
+.TP
+.B POST /ingest
+Node\-to\-coordinator telemetry. See
+.B INGEST PROTOCOL
+below.
+.SH INGEST PROTOCOL
+Nodes POST application/json to
+.BR /ingest .
+Request envelope:
+.PP
+.nf
+   {
+     "source":    "ESP32-WarDriver" | "ESP32-WarSniffer" | "ESP32-BlueDriver",
+     "ver":       "1.0.0",
+     "linkEpoch": <n>,        // last epoch this node saw from the C2
+     "lastCmdId": <n>,        // highest command id this node has applied
+     "status":    { ... },    // uptime, heap, frame counters, gps, etc.
+     "count":     <n>,
+     "devices" | "aps" | "alerts" | "probes": [ ... ]
+   }
+.fi
+.PP
+Response envelope:
+.PP
+.nf
+   {
+     "ok":    1,
+     "epoch": <nonce>,        // per-node boot nonce assigned by the C2
+     "commands": [ { "id": <n>, "cmd": "scan", "on": 0 }, ... ]
+   }
+.fi
+.PP
+Command grammar (in the response
+.B commands
+array):
+.PP
+.nf
+   cmd      fields                       effect
+   scan     on:1/0                       start / stop scanning
+   clear    -                            wipe the node's device store
+   hop      on:1/0                       WarSniffer: channel hopping on/off
+   config   on:<ch>                      WarSniffer: lock to a channel
+   config   activeScan:1/0               BlueDriver: active vs passive scan
+   gatt     mac:"AA:..", addrType:0/1    BlueDriver: enumerate GATT (~8 s)
+.fi
+.PP
+Each command has a monotonic
+.BR id .
+A node acknowledges by echoing its highest applied id as
+.B lastCmdId
+in subsequent requests; the coordinator then drops acknowledged commands from
+the queue. The
+.B linkEpoch
+/
+.B epoch
+handshake provides exactly\(hyonce delivery across a reboot of either board: a
+new epoch resets the node's ack counter so stale, pre\(hyreboot acks cannot
+silently drop fresh commands.
+.SH FILES
+.TP
+.B <component>/src/config.h
+Compile\-time configuration for each component.
+.TP
+.B <component>/platformio.ini
+PlatformIO board, build flags, and library dependencies.
+.TP
+.B <component>/partitions.csv
+Flash partition layout.
+.TP
+.B /wigle.csv
+WigleWifi\-1.4 survey log written to the WarDriver's LittleFS partition
+(path set by
+.B WIFI_LOG_PATH
+in config.h).
+.SH EXAMPLES
+.TP
+Flash everything (coordinator first):
+.nf
+   (cd c2-esp32s2     && pio run -t upload)
+   (cd wardriver-node && pio run -t upload)
+   (cd warsniffer-node && pio run -t upload)
+   (cd bluedriver-node && pio run -t upload)
+.fi
+.TP
+Stop the WarDriver scan from the command line:
+.nf
+   curl -X POST http://192.168.4.1/api/cmd \\
+        -H 'Content-Type: application/json' \\
+        -d '{"target":"wardriver","cmd":"scan","on":0}'
+.fi
+.TP
+Enumerate GATT on a discovered BLE device (addrType 1 = random):
+.nf
+   curl -X POST http://192.168.4.1/api/cmd \\
+        -H 'Content-Type: application/json' \\
+        -d '{"target":"bluedriver","cmd":"gatt","mac":"AA:BB:CC:DD:EE:FF","addrType":1}'
+.fi
+.TP
+Export the WiFi inventory as CSV:
+.nf
+   curl -OJ http://192.168.4.1/api/export/wifi
+.fi
+.TP
+Pull the WarDriver's WigleWifi log over USB:
+.nf
+   (cd wardriver-node && pio run -t uploadfs)   # (re)init the data partition
+   # or read /wigle.csv via your own LittleFS tooling
+.fi
+.SH SECURITY AND LEGAL
+This toolkit is for
+.B authorized testing only.
+Operate it only on networks and devices you own or have explicit written
+authorization to assess. Passive 802.11 monitoring, active WiFi/BLE scanning,
+probe\(hyrequest collection, and GATT enumeration may be regulated or prohibited
+in your jurisdiction; you are responsible for compliance. Channel 14 and any
+transmit\(hyrelated configuration must only be enabled where legally permitted.
+.PP
+By design the toolkit does not transmit deauthentication or injection frames,
+does not operate a rogue access point, and does not store raw packet payloads
+or WPA handshakes \(em EAPOL frames are counted, never captured. The SoftAP is
+WPA2\(hyprotected; change the default credentials before any use.
+.SH SEE ALSO
+.BR curl (1),
+.BR man (1)
+.PP
+Project README and per\-component source comments. PlatformIO documentation at
+<https://docs.platformio.org/>. WigleWifi CSV format at <https://wigle.net/>.
+.SH BUGS
+Report issues at the project repository:
+<https://github.com/aingram702/esp32-net>.
+.SH AUTHORS
+The ESP32\-Net contributors.
