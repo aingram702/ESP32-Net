@@ -140,10 +140,10 @@ public:
              (uint8_t)rawMac[0], (uint8_t)rawMac[3], (uint8_t)rawMac[6],
              (uint8_t)rawMac[9], (uint8_t)rawMac[12],(uint8_t)rawMac[15]);
     // Parse hex from string instead — rawMac is "aa:bb:cc:dd:ee:ff"
-    unsigned a,b,c,dd,e,f;
+    unsigned a,b,c,dd,m4,f;
     if (sscanf(rawMac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x",
-               &a,&b,&c,&dd,&e,&f) == 6) {
-      snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",a,b,c,dd,e,f);
+               &a,&b,&c,&dd,&m4,&f) == 6) {
+      snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",a,b,c,dd,m4,f);
     }
 
     int8_t rssi = (int8_t) d->getRSSI();
@@ -255,7 +255,6 @@ static String doGatt(const char* macStr, uint8_t addrType) {
   if (!pClient) { startScan(); return "{\"err\":\"createClient failed\"}"; }
 
   pClient->setConnectionParams(12, 12, 0, 200);
-  pClient->setTimeout(10);
 
   if (!pClient->connect(addr)) {
     NimBLEDevice::deleteClient(pClient);
@@ -269,32 +268,40 @@ static String doGatt(const char* macStr, uint8_t addrType) {
   doc["addrType"] = addrType;
   JsonArray svcs = doc["services"].to<JsonArray>();
 
-  // getServices() with true = refresh from peer
-  const std::vector<NimBLERemoteService*>* services = pClient->getServices(true);
-  if (services) {
-    for (NimBLERemoteService* svc : *services) {
-      JsonObject so = svcs.add<JsonObject>();
-      so["uuid"] = svc->getUUID().toString().c_str();
-      JsonArray chars = so["chars"].to<JsonArray>();
-      const std::vector<NimBLERemoteCharacteristic*>* chrs = svc->getCharacteristics(true);
-      if (chrs) {
-        for (NimBLERemoteCharacteristic* ch : *chrs) {
-          JsonObject co = chars.add<JsonObject>();
-          co["uuid"]  = ch->getUUID().toString().c_str();
-          co["props"] = ch->getProperties();
-          // Read value only if readable (best-effort; skip on error)
-          if (ch->canRead()) {
-            NimBLEAttValue val = ch->readValue();
-            if (val.size() > 0 && val.size() <= 32) {
-              // Hex-encode the raw bytes
-              String hex = "";
-              for (size_t i = 0; i < val.size(); i++) {
-                char hb[3]; snprintf(hb, sizeof(hb), "%02X", val[i]);
-                hex += hb;
-              }
-              co["val"] = hex.c_str();
-            }
+  // getServices(true) refreshes from peer; returns a const reference in NimBLE v2.x
+  const std::vector<NimBLERemoteService*>& services = pClient->getServices(true);
+  for (NimBLERemoteService* svc : services) {
+    JsonObject so = svcs.add<JsonObject>();
+    so["uuid"] = svc->getUUID().toString().c_str();
+    JsonArray chars = so["chars"].to<JsonArray>();
+
+    // getCharacteristics(true) also returns a const reference in NimBLE v2.x
+    const std::vector<NimBLERemoteCharacteristic*>& chrs = svc->getCharacteristics(true);
+    for (NimBLERemoteCharacteristic* ch : chrs) {
+      JsonObject co = chars.add<JsonObject>();
+      co["uuid"] = ch->getUUID().toString().c_str();
+
+      // NimBLE v2.x removed getProperties(); derive from individual capability flags.
+      // Bit positions follow the BLE spec (GATT Characteristic Properties).
+      uint8_t props = 0;
+      if (ch->canBroadcast())        props |= 0x01;
+      if (ch->canRead())             props |= 0x02;
+      if (ch->canWriteNoResponse())  props |= 0x04;
+      if (ch->canWrite())            props |= 0x08;
+      if (ch->canNotify())           props |= 0x10;
+      if (ch->canIndicate())         props |= 0x20;
+      co["props"] = props;
+
+      // Read value only if readable (best-effort; skip on error)
+      if (ch->canRead()) {
+        NimBLEAttValue val = ch->readValue();
+        if (val.size() > 0 && val.size() <= 32) {
+          String hex = "";
+          for (size_t vi = 0; vi < val.size(); vi++) {
+            char hb[3]; snprintf(hb, sizeof(hb), "%02X", (uint8_t)val[vi]);
+            hex += hb;
           }
+          co["val"] = hex.c_str();
         }
       }
     }
