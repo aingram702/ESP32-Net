@@ -176,6 +176,14 @@ static volatile bool g_scanning = true;
 static uint32_t g_bootMs = 0;
 static uint32_t g_newCount = 0;
 
+// Self-healing state (declared early: doScan() uses them). Track the last
+// successful C2 report and consecutive scan failures so the loop watchdog can
+// reset the radio (or reboot) if the shared WiFi stack wedges.
+static uint32_t g_lastReportOkMs = 0;
+static uint32_t g_scanFails      = 0;
+static uint32_t g_lastResetMs    = 0;
+static void resetRadio();        // defined below
+
 static int findOrAdd(const char* bssid) {
   for (int i = 0; i < g_apN; i++) if (!strcasecmp(g_aps[i].bssid, bssid)) return i;
   if (g_apN >= MAX_APS) return -1;
@@ -188,6 +196,11 @@ static void doScan() {
   if (!g_scanning) return;
   int n = WiFi.scanNetworks(false, true);   // sync, include hidden
   pumpGps();
+  if (n < 0) {                              // WIFI_SCAN_FAILED / RUNNING
+    if (++g_scanFails >= SCAN_FAIL_LIMIT) resetRadio();
+    return;
+  }
+  g_scanFails = 0;
   for (int i = 0; i < n; i++) {
     uint8_t* raw = WiFi.BSSID(i);
     char bssid[18];
@@ -224,6 +237,20 @@ static void doScan() {
 //  Report to C2
 // ---------------------------------------------------------------------------
 static uint32_t g_linkEpoch = 0, g_lastCmdId = 0;
+
+// Fully reset the WiFi stack — recovers a wedged radio (scans returning -1/-2
+// or the C2 association stuck) without a full reboot.
+static void resetRadio() {
+  Serial.println("[WD] resetting WiFi radio (watchdog)");
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  g_lastResetMs   = millis();
+  g_scanFails     = 0;
+}
 
 static void clearStore() {
   for (int i = 0; i < g_apN; i++) g_aps[i].used = false;
@@ -287,6 +314,7 @@ static void reportToC2() {
     http.addHeader("Content-Type", "application/json");
     int code = http.POST(body);
     if (code == 200) {
+      g_lastReportOkMs = millis();          // feed the connectivity watchdog
       // mark the batch uploaded
       int marked = 0;
       for (int i = 0; i < g_apN && marked < sent; i++)
@@ -295,7 +323,12 @@ static void reportToC2() {
       JsonDocument rd;
       if (!deserializeJson(rd, resp)) {
         uint32_t ne = rd["epoch"] | 0;
-        if (ne && ne != g_linkEpoch) { g_linkEpoch = ne; g_lastCmdId = 0; }
+        if (ne && ne != g_linkEpoch) {
+          g_linkEpoch = ne; g_lastCmdId = 0;
+          // C2 (re)booted: re-sync our whole inventory so its store — and the
+          // CSV export — holds every network we've found, not just future ones.
+          for (int i = 0; i < g_apN; i++) g_aps[i].uploaded = false;
+        }
         applyCommands(rd["commands"].as<JsonArrayConst>());
       }
     }
@@ -321,6 +354,10 @@ void setup() {
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);            // disable modem power-save: keeps the C2 link
+                                   // stable and stops scans/commands stalling
+  WiFi.setAutoReconnect(true);
+  g_lastReportOkMs = millis();     // grace period before the watchdog can fire
   ensureC2();
 }
 
@@ -333,6 +370,15 @@ void loop() {
     tReport = millis();
     setLed(0, 0, 48);                          // blue: associating + POSTing
     reportToC2();
+  }
+
+  // ---- connectivity watchdog: recover a wedged radio, reboot as last resort
+  uint32_t sinceOk = millis() - g_lastReportOkMs;
+  if (sinceOk > WIFI_REBOOT_MS) {
+    Serial.println("[WD] no C2 contact too long — rebooting");
+    delay(50); ESP.restart();
+  } else if (sinceOk > WIFI_WATCHDOG_MS && millis() - g_lastResetMs > WIFI_WATCHDOG_MS) {
+    resetRadio();
   }
 
   // idle status colour between report bursts

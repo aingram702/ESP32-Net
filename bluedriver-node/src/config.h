@@ -26,15 +26,25 @@
 #define WIFI_CONNECT_MS     8000   // STA connect timeout at startup / reconnect
 #define UPLINK_BATCH_MAX    40     // max devices per POST (newest unsent first)
 
+// ---- Reliability / self-healing watchdog -----------------------------------
+// BLE and WiFi share one radio via software coexistence. These thresholds drive
+// automatic recovery so the BLE scan or the C2 link don't silently die.
+#define SCAN_WATCHDOG_MS    8000   // g_scanning but not actually scanning -> restart
+#define WIFI_WATCHDOG_MS    45000  // no successful C2 report this long -> reset WiFi
+#define WIFI_REBOOT_MS      180000 // no successful C2 report this long -> reboot
+
 // ---- Device store ----------------------------------------------------------
 #define MAX_BLE_DEVS   300
 
 // ---- BLE scan defaults (tunable via "config" commands from the C2) ---------
 #define DEFAULT_ACTIVE_SCAN  true  // active scan = send scan-request, get more data
                                    // passive scan = observe only (stealthier)
-// NimBLE scan parameters (units: 0.625 ms per unit)
-#define SCAN_INTERVAL   80         //  80 × 0.625 = 50 ms
-#define SCAN_WINDOW     80         //  same as interval = 100% duty-cycle while timeslot is ours
+// NimBLE scan parameters (units: 0.625 ms per unit). The scan WINDOW must be
+// shorter than the INTERVAL so the coexistence arbiter has radio time to keep
+// the WiFi link to the C2 alive — a 100%% duty cycle (window==interval) starves
+// WiFi and the node drops off after a few minutes.
+#define SCAN_INTERVAL   160        // 160 × 0.625 = 100 ms (scan period)
+#define SCAN_WINDOW     80         //  80 × 0.625 =  50 ms  (50%% duty; rest for WiFi)
 
 // ---- Onboard WS2812 status LED (DevKitC-1, GPIO48) -------------------------
 // green=scanning, blue=reporting, purple=GATT enum in progress, amber=scan off.

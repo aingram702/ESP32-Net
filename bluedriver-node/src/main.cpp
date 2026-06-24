@@ -50,8 +50,14 @@ struct BLEEntry {
 static BLEEntry g_devs[MAX_BLE_DEVS];
 static int      g_devN      = 0;
 static uint32_t g_newCount  = 0;
-static bool     g_scanning  = true;
-static bool     g_activeScan = DEFAULT_ACTIVE_SCAN;
+// Written from the main loop (core 1), read from the NimBLE callback (core 0):
+// must be volatile so the scan callback always sees the current state.
+static volatile bool g_scanning   = true;
+static volatile bool g_activeScan = DEFAULT_ACTIVE_SCAN;
+
+// Self-healing state for the loop watchdog.
+static uint32_t g_lastReportOkMs = 0;
+static uint32_t g_lastResetMs    = 0;
 
 // Mutex protecting the device store — written from NimBLE task (core 0),
 // read from main loop (core 1).
@@ -349,8 +355,12 @@ static void applyCommands(JsonArrayConst cmds) {
     } else if (!strcmp(cmd, "clear")) {
       clearStore();
     } else if (!strcmp(cmd, "config")) {
-      // config activeScan:1/0
-      bool want = c["activeScan"].is<int>() ? (int)c["activeScan"] != 0 : g_activeScan;
+      // config on:1/0  -> active(1) vs passive(0) scan. The dashboard's ACTIVE
+      // SCAN / PASSIVE buttons send the choice in "on"; also accept the legacy
+      // "activeScan" field for compatibility.
+      bool want = g_activeScan;
+      if      (hasOn)                      want = (on != 0);
+      else if (c["activeScan"].is<int>()) want = ((int)c["activeScan"] != 0);
       if (want != g_activeScan) {
         g_activeScan = want;
         if (g_scanning) restartScan();   // mode change requires restart
@@ -374,6 +384,8 @@ static void applyCommands(JsonArrayConst cmds) {
 static bool ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);            // disable modem power-save (stabilises coex)
+  WiFi.setAutoReconnect(true);
   WiFi.begin(C2_SSID, C2_PASSWORD);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS)
@@ -383,6 +395,16 @@ static bool ensureWiFi() {
   else
     Serial.println("[BD] WiFi connect timeout");
   return WiFi.status() == WL_CONNECTED;
+}
+
+// Reset just the WiFi stack (leaves NimBLE running) to recover a dropped link.
+static void resetWiFi() {
+  Serial.println("[BD] resetting WiFi (watchdog)");
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+  g_lastResetMs = millis();
+  ensureWiFi();
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +475,7 @@ static void reportToC2() {
   int code = http.POST(body);
 
   if (code == 200) {
+    g_lastReportOkMs = millis();          // feed the connectivity watchdog
     String resp = http.getString();
     JsonDocument rd;
     if (!deserializeJson(rd, resp)) {
@@ -461,6 +484,11 @@ static void reportToC2() {
       if (newEpoch && newEpoch != g_linkEpoch) {
         g_linkEpoch  = newEpoch;
         g_lastCmdId  = 0;           // remote rebooted; reset ack counter
+        // Re-sync the whole device store to the fresh C2 so its inventory and
+        // CSV export hold every device we've seen, not just future ones.
+        storeLock();
+        for (int i = 0; i < g_devN; i++) g_devs[i].uploaded = false;
+        storeUnlock();
       }
       // Mark uploaded only if POST was acked
       storeLock();
@@ -505,6 +533,7 @@ void setup() {
 
   // WiFi (coexistence arbiter handles sharing with BLE automatically)
   WiFi.persistent(false);
+  g_lastReportOkMs = millis();    // grace period before the watchdog can fire
   ensureWiFi();
 
   Serial.printf("[BD] BLE scan started (%s)  WiFi=%s\n",
@@ -537,6 +566,32 @@ void loop() {
     g_gattResultReady = true;
     // Result ships in the very next reportToC2()
     tReport = 0;   // force an immediate report cycle
+  }
+
+  // ---- Scan-health watchdog: restart a BLE scan that has silently stopped --
+  static uint32_t tScanChk = 0;
+  if (millis() - tScanChk >= 2000) {
+    tScanChk = millis();
+    static uint32_t scanDownSince = 0;
+    if (g_scanning && pScan && !pScan->isScanning() && !g_gattJob.pending) {
+      if (scanDownSince == 0) scanDownSince = millis();
+      else if (millis() - scanDownSince >= SCAN_WATCHDOG_MS) {
+        Serial.println("[BD] BLE scan stalled — restarting");
+        startScan();
+        scanDownSince = 0;
+      }
+    } else {
+      scanDownSince = 0;
+    }
+  }
+
+  // ---- Connectivity watchdog: reset WiFi, reboot as a last resort ----------
+  uint32_t sinceOk = millis() - g_lastReportOkMs;
+  if (sinceOk > WIFI_REBOOT_MS) {
+    Serial.println("[BD] no C2 contact too long — rebooting");
+    delay(50); ESP.restart();
+  } else if (sinceOk > WIFI_WATCHDOG_MS && millis() - g_lastResetMs > WIFI_WATCHDOG_MS) {
+    resetWiFi();
   }
 
   // idle status colour: green when scanning, amber when paused

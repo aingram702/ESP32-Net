@@ -262,13 +262,24 @@ All endpoints are served by the coordinator on port 80.
 | `GET /` | The dashboard (HTML) |
 | `GET /api/data` | Full aggregate snapshot (JSON) — polled by the dashboard |
 | `POST /api/cmd` | Queue a control command for a node |
-| `GET /api/export/wifi` | WarDriver inventory as CSV |
+| `GET /api/export/wifi` | WarDriver inventory as CSV (incl. GPS lat/lon) |
 | `GET /api/export/ble` | BlueDriver inventory as CSV |
 | `GET /api/export/sniff` | WarSniffer AP inventory as CSV |
 | `POST /ingest` | Node telemetry (see below) |
 
-Each dashboard tab also has an **`EXPORT CSV`** button. Exports are RFC-4180 and
-sent with a `Content-Disposition` attachment header, e.g.:
+Each dashboard tab has an **`EXPORT CSV`** button that downloads every device
+that node has reported. Exports are RFC-4180 and sent with a
+`Content-Disposition` attachment header. The WarDriver CSV columns are
+`BSSID, SSID, Channel, Frequency, Encryption, RSSI, Latitude, Longitude, Vendor,
+Flag, AgeSec` — a complete, organized network list ready for reporting or import.
+The BlueDriver CSV lists every BLE device with address, name, type, vendor,
+manufacturer ID, RSSI, hit count, and service UUIDs.
+
+> The WarDriver also writes a full WigleWifi-1.4 log to `/wigle.csv` on its own
+> LittleFS partition — the canonical, GPS-stamped record for wigle.net uploads in
+> very dense environments that exceed the C2's in-RAM cap.
+
+Examples:
 
 ```bash
 curl -OJ http://192.168.4.1/api/export/wifi      # -> wifi.csv
@@ -320,15 +331,21 @@ All three nodes POST `application/json` to `http://192.168.4.1/ingest`.
 | `clear` | — | Wipe the node's device store |
 | `hop` | `on:1/0` | WarSniffer: channel hopping on/off |
 | `config` | `on:<ch>` | WarSniffer: lock to a specific channel |
-| `config` | `activeScan:1/0` | BlueDriver: active vs passive BLE scan |
+| `config` | `on:1/0` | BlueDriver: active(1) vs passive(0) BLE scan |
 | `gatt` | `mac:"AA:..", addrType:0/1` | BlueDriver: connect + enumerate GATT (~8 s) |
 
 Commands carry a monotonic `id`. A node acks by echoing its highest applied id
 as `lastCmdId`; the coordinator then drops acked commands from the queue. The
 `linkEpoch` / `epoch` handshake gives **exactly-once delivery across a reboot of
 either board** — a fresh epoch resets the node's ack counter so stale
-post-reboot acks can't silently drop new commands. The C2 command queue carries
-the `gatt` target `mac` + `addrType` through to the node.
+post-reboot acks can't silently drop new commands, and triggers a node to
+re-sync its full inventory so the C2 store (and CSV export) repopulates after a
+C2 reboot. The C2 command queue carries the `gatt` target `mac` + `addrType`
+through to the node.
+
+> Control commands are delivered on the node's next check-in (every few
+> seconds), not instantly. The dashboard shows a "queued" toast on each press so
+> you get immediate confirmation the command was accepted.
 
 ---
 
@@ -369,16 +386,39 @@ man 7 esp32-net
 
 ---
 
+## Reliability & self-healing
+
+The WarDriver and BlueDriver share one 2.4 GHz radio between scanning and the C2
+uplink, which can wedge the WiFi stack over long runs. Both nodes now:
+
+- **Disable WiFi modem power-save** (`WiFi.setSleep(false)`) — the main cause of
+  associations silently dropping over time, especially under BLE coexistence.
+- **Cap the BLE scan duty cycle** (BlueDriver: 50%, `SCAN_WINDOW < SCAN_INTERVAL`)
+  so the coexistence arbiter always has airtime to keep the WiFi link alive.
+- **Run watchdogs**: if the BLE scan stalls it is restarted; if the C2 can't be
+  reached for `WIFI_WATCHDOG_MS` the WiFi stack is reset, and after
+  `WIFI_REBOOT_MS` the node reboots. The WarDriver also resets the radio after
+  repeated `scanNetworks()` failures.
+- **Re-sync on C2 reboot** so the dashboard and CSV exports repopulate with every
+  previously-found device, not just new ones.
+
+Tune the thresholds in each node's `config.h`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
 | Node shows **OFFLINE** | Wrong `C2_SSID`/`C2_PASSWORD`, C2 not flashed/powered, or out of range. Check the node's serial console. |
+| Buttons seem to do nothing | Commands apply on the node's next check-in (a few seconds); watch for the dashboard "queued" toast. If a node is OFFLINE its commands can't be delivered — fix connectivity first. |
 | Dashboard won't load | Confirm you joined `ESP32-NET`; try `http://192.168.4.1/` directly if mDNS fails. |
+| Node drops off after minutes | Addressed by the self-healing above; if it persists, lower `REPORT_INTERVAL_MS` or check power/antenna. |
 | WarDriver GPS never fixes | Needs clear sky view; verify TX→RX/RX→TX wiring and `GPS_BAUD`. LED stays cyan until a fix. |
 | `/wigle.csv` is empty | Rows are only logged after a GPS fix. No fix = no rows by design. |
+| CSV export incomplete | The C2 holds up to `MAX_*` of the most-recent devices; raise the caps (RAM permitting) or use the WarDriver's on-flash `/wigle.csv`. |
 | GATT enumeration fails | Device may require bonding, reject the connection, or use a different `addrType`. The error appears in the dashboard GATT panel. |
-| BLE scan rate seems low | Expected: BLE shares the 2.4 GHz radio with WiFi via time-division coexistence. |
+| BLE scan rate seems low | Expected: BLE shares the 2.4 GHz radio with WiFi at a 50% scan duty cycle for link stability. |
 | Out-of-memory / resets on C2 | Lower the `MAX_*` store caps in `c2-esp32s2/src/config.h`. |
 
 ---

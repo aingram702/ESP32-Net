@@ -25,6 +25,14 @@
 #define WIFI_CONNECT_MS    6000     // C2 association timeout per report
 #define UPLINK_BATCH_MAX   40       // networks per POST
 
+// ---- Reliability / self-healing watchdog -----------------------------------
+// The radio is shared between WiFi.scanNetworks() and the C2 uplink; over long
+// runs the WiFi stack can wedge. These thresholds drive automatic recovery so
+// scanning and command delivery don't silently die after a few minutes.
+#define SCAN_FAIL_LIMIT       4      // consecutive failed scans -> reset radio
+#define WIFI_WATCHDOG_MS      45000  // no successful C2 report this long -> reset radio
+#define WIFI_REBOOT_MS        180000 // no successful C2 report this long -> reboot
+
 // ---- Inventory + logging ---------------------------------------------------
 #define MAX_APS            300
 #define LOG_TO_FLASH       true
