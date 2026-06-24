@@ -34,6 +34,8 @@ struct WiFiAP {
   int8_t   rssi      = -128;
   char     vendor[24]= {0};
   char     flag[20]  = {0};   // threat label, e.g. "FLOCK CAMERA"; "" if none
+  double   lat = 0, lon = 0;  // GPS stamp from the WarDriver (best-RSSI fix)
+  bool     hasGps    = false;
   uint32_t seenMs    = 0;     // C2 millis() of last update
 };
 struct BLEDev {
@@ -164,7 +166,10 @@ static void upsertWiFi(JsonObjectConst o) {
   if (!*mac) return;
   int idx = -1;
   for (int i = 0; i < g_wifiN; i++) if (!strcasecmp(g_wifi[i].mac, mac)) { idx = i; break; }
-  if (idx < 0) idx = (g_wifiN < MAX_WIFI_APS) ? g_wifiN++ : oldestSlot(g_wifi, g_wifiN);
+  if (idx < 0) {
+    idx = (g_wifiN < MAX_WIFI_APS) ? g_wifiN++ : oldestSlot(g_wifi, g_wifiN);
+    g_wifi[idx] = WiFiAP();          // reset reused slot (avoids stale GPS/flag)
+  }
   WiFiAP& a = g_wifi[idx];
   cpy(a.mac, sizeof(a.mac), mac);
   cpy(a.ssid, sizeof(a.ssid), o["ssid"] | "");
@@ -173,6 +178,8 @@ static void upsertWiFi(JsonObjectConst o) {
   a.rssi = o["rssi"] | (int)-128;
   cpy(a.vendor, sizeof(a.vendor), o["vendor"] | "");
   cpy(a.flag, sizeof(a.flag), o["threat"] | o["flag"] | "");
+  double lat = o["lat"] | 0.0, lon = o["lon"] | 0.0;
+  if (lat != 0.0 || lon != 0.0) { a.lat = lat; a.lon = lon; a.hasGps = true; }
   a.seenMs = millis();
 }
 
@@ -181,7 +188,10 @@ static void upsertBLE(JsonObjectConst o) {
   if (!*mac) return;
   int idx = -1;
   for (int i = 0; i < g_bleN; i++) if (!strcasecmp(g_ble[i].mac, mac)) { idx = i; break; }
-  if (idx < 0) idx = (g_bleN < MAX_BLE_DEVS) ? g_bleN++ : oldestSlot(g_ble, g_bleN);
+  if (idx < 0) {
+    idx = (g_bleN < MAX_BLE_DEVS) ? g_bleN++ : oldestSlot(g_ble, g_bleN);
+    g_ble[idx] = BLEDev();           // reset reused slot (avoids stale hits)
+  }
   BLEDev& d = g_ble[idx];
   cpy(d.mac, sizeof(d.mac), mac);
   cpy(d.name, sizeof(d.name), o["name"] | "");
@@ -222,7 +232,10 @@ static void upsertProbe(JsonObjectConst o) {
   if (!*ssid) return;
   int idx = -1;
   for (int i = 0; i < g_prbN; i++) if (!strcmp(g_prb[i].ssid, ssid)) { idx = i; break; }
-  if (idx < 0) idx = (g_prbN < MAX_PROBES) ? g_prbN++ : oldestSlot(g_prb, g_prbN);
+  if (idx < 0) {
+    idx = (g_prbN < MAX_PROBES) ? g_prbN++ : oldestSlot(g_prb, g_prbN);
+    g_prb[idx] = Probe();            // reset reused slot (avoids stale hits)
+  }
   Probe& p = g_prb[idx];
   cpy(p.ssid, sizeof(p.ssid), ssid);
   p.hits   = o["hits"] | (int)(p.hits + 1);
@@ -371,17 +384,23 @@ static void csvField(AsyncResponseStream* rs, const char* s) {
   rs->print('"');
 }
 
+static int wifiChanToFreq(int ch) {
+  return (ch >= 1 && ch <= 13) ? 2407 + ch * 5 : (ch == 14 ? 2484 : 0);
+}
+
 static void handleExportWiFi(AsyncWebServerRequest* req) {
   AsyncResponseStream* rs = req->beginResponseStream("text/csv");
   rs->addHeader("Content-Disposition", "attachment; filename=wifi.csv");
-  rs->print("BSSID,SSID,Channel,Encryption,RSSI,Vendor,Flag,AgeSec\n");
+  rs->print("BSSID,SSID,Channel,Frequency,Encryption,RSSI,Latitude,Longitude,Vendor,Flag,AgeSec\n");
   uint32_t now = millis();
   for (int i = 0; i < g_wifiN; i++) {
     csvField(rs, g_wifi[i].mac);  rs->print(',');
     csvField(rs, g_wifi[i].ssid); rs->print(',');
-    rs->printf("%u,", (unsigned)g_wifi[i].ch);
+    rs->printf("%u,%d,", (unsigned)g_wifi[i].ch, wifiChanToFreq(g_wifi[i].ch));
     csvField(rs, g_wifi[i].enc);  rs->print(',');
     rs->printf("%d,", (int)g_wifi[i].rssi);
+    if (g_wifi[i].hasGps) rs->printf("%.6f,%.6f,", g_wifi[i].lat, g_wifi[i].lon);
+    else                  rs->print(",,");
     csvField(rs, g_wifi[i].vendor); rs->print(',');
     csvField(rs, g_wifi[i].flag);   rs->print(',');
     rs->printf("%u\n", (unsigned)((now - g_wifi[i].seenMs) / 1000));

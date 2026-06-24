@@ -12,7 +12,9 @@
 
 // ---- HTTP ingest -----------------------------------------------------------
 #define INGEST_PATH    "/ingest"      // nodes POST their JSON here
-#define MAX_BODY_BYTES 9000           // reject oversized POST bodies
+// Must comfortably exceed a full device batch (~40 entries) plus a GATT result;
+// otherwise the whole report is dropped and queued commands never reach the node.
+#define MAX_BODY_BYTES 16384          // reject oversized POST bodies
 
 // ---- In-RAM store caps (keep modest: the S2 has limited heap) --------------
 #define MAX_WIFI_APS    128           // WarDriver inventory

@@ -85,6 +85,11 @@ tr:hover td{background:#07261759}
 .muted{color:var(--muted)}
 .empty{padding:24px;text-align:center;color:var(--muted)}
 .foot{padding:10px 16px;color:var(--muted);font-size:11px;border-top:1px solid var(--line)}
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:10000;
+  background:#06190f;border:1px solid var(--accent-dim);color:var(--accent);
+  padding:8px 14px;border-radius:6px;font-size:12px;letter-spacing:.5px;
+  opacity:0;transition:opacity .25s;pointer-events:none;max-width:92vw;
+  box-shadow:0 0 14px rgba(0,0,0,.5)}
 </style>
 </head>
 <body>
@@ -187,6 +192,7 @@ tr:hover td{background:#07261759}
 </main>
 
 <div class="foot">ESP32-Net C2 dashboard &middot; passive recon / WIDS &middot; authorized testing only</div>
+<div id="toast"></div>
 
 <script>
 "use strict";
@@ -214,11 +220,25 @@ function kb(b){ return b==null?"--":Math.round(b/1024)+"K"; }
 function setDot(id,online){ var e=document.getElementById(id);
   e.className="dot"+(online?" ok":""); }
 
+var _toastT=null;
+function toast(msg,bad){
+  var t=document.getElementById("toast");
+  t.textContent=msg; t.style.borderColor=bad?"var(--crit)":"var(--accent-dim)";
+  t.style.color=bad?"#ff8ba0":"var(--accent)"; t.style.opacity="1";
+  if(_toastT) clearTimeout(_toastT);
+  _toastT=setTimeout(function(){t.style.opacity="0";},2200);
+}
 function cmd(target,c,on){
   var body={target:target,cmd:c};
   if(on!==undefined) body.on=on;
+  var label=(c+(on===undefined?"":" "+on)).toUpperCase();
   fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body)}).catch(function(){});
+    body:JSON.stringify(body)})
+    .then(function(r){
+      if(r.ok) toast("queued: "+target+" "+label+" (applies on next check-in)");
+      else toast("rejected: "+target+" "+label,true);
+    })
+    .catch(function(){ toast("C2 unreachable — command not sent",true); });
 }
 
 function render(d){
@@ -303,7 +323,9 @@ function render(d){
 // queue a GATT enumeration for a tapped BLE device
 function gatt(mac,addrType){
   fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({target:"bluedriver",cmd:"gatt",mac:mac,addrType:addrType})}).catch(function(){});
+    body:JSON.stringify({target:"bluedriver",cmd:"gatt",mac:mac,addrType:addrType})})
+    .then(function(r){ toast(r.ok?"GATT queued for "+mac:"GATT request rejected",!r.ok); })
+    .catch(function(){ toast("C2 unreachable — GATT not sent",true); });
   document.getElementById("bd-gatt").textContent="GATT enumeration queued for "+mac+" — result appears here in ~10s...";
 }
 
