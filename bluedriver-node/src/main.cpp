@@ -383,6 +383,12 @@ static void applyCommands(JsonArrayConst cmds) {
 // ---------------------------------------------------------------------------
 static bool ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
+  // A continuous BLE scan starves the shared 2.4 GHz radio and can stop the STA
+  // from ever associating. Pause scanning for the duration of the connect, then
+  // resume — this is the key fix for "BlueDriver won't connect".
+  bool wasScanning = (pScan && pScan->isScanning());
+  if (wasScanning) { pScan->stop(); delay(20); }
+
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);            // disable modem power-save (stabilises coex)
   WiFi.setAutoReconnect(true);
@@ -390,11 +396,12 @@ static bool ensureWiFi() {
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS)
     delay(100);
-  if (WiFi.status() == WL_CONNECTED)
-    Serial.printf("[BD] WiFi connected  ip=%s\n", WiFi.localIP().toString().c_str());
-  else
-    Serial.println("[BD] WiFi connect timeout");
-  return WiFi.status() == WL_CONNECTED;
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  if (ok) Serial.printf("[BD] WiFi connected  ip=%s\n", WiFi.localIP().toString().c_str());
+  else    Serial.println("[BD] WiFi connect timeout");
+
+  if (g_scanning) startScan();     // resume the survey (no-op if already running)
+  return ok;
 }
 
 // Reset just the WiFi stack (leaves NimBLE running) to recover a dropped link.
@@ -529,12 +536,13 @@ void setup() {
 
   pScan = NimBLEDevice::getScan();
   pScan->setScanCallbacks(&g_scanCB, true);  // true = wantDuplicates (for RSSI)
-  startScan();
 
-  // WiFi (coexistence arbiter handles sharing with BLE automatically)
+  // Connect WiFi FIRST (no BLE scan competing for the radio), THEN start the
+  // continuous scan. ensureWiFi() resumes the scan once associated.
   WiFi.persistent(false);
   g_lastReportOkMs = millis();    // grace period before the watchdog can fire
   ensureWiFi();
+  startScan();
 
   Serial.printf("[BD] BLE scan started (%s)  WiFi=%s\n",
                 g_activeScan ? "active" : "passive",

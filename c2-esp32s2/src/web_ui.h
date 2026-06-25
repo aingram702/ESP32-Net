@@ -90,6 +90,19 @@ tr:hover td{background:#07261759}
   padding:8px 14px;border-radius:6px;font-size:12px;letter-spacing:.5px;
   opacity:0;transition:opacity .25s;pointer-events:none;max-width:92vw;
   box-shadow:0 0 14px rgba(0,0,0,.5)}
+/* Wireshark-style live capture */
+.filter{background:#04140d;border:1px solid var(--line);color:var(--txt);
+  padding:6px 10px;border-radius:5px;font-family:var(--mono);font-size:12px;min-width:200px}
+.pkt-list{max-height:34vh}
+.pkt-list tr{cursor:pointer}
+.pkt-list tr.sel td{background:#0c3a26 !important;box-shadow:inset 2px 0 0 var(--accent)}
+.pkt-detail{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.pkt-tree,.pkt-hex{flex:1 1 320px;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:10px;max-height:30vh;overflow:auto;white-space:pre;
+  font-size:11px;line-height:1.5}
+.pkt-hex{color:var(--accent)}
+.pk-mgmt{color:var(--info)} .pk-data{color:var(--accent)} .pk-ctrl{color:var(--muted)}
+.pk-deauth{color:var(--crit);font-weight:700} .pk-beacon{color:#8ab4ff}
 </style>
 </head>
 <body>
@@ -168,6 +181,34 @@ tr:hover td{background:#07261759}
     <div class="tablewrap" style="max-height:24vh"><table>
       <thead><tr><th>SSID</th><th>Hits</th><th>Last seen</th></tr></thead>
       <tbody id="ws-probes"></tbody>
+    </table></div>
+
+    <h4 class="muted">&#9776; LIVE CAPTURE <span class="muted" id="cap-stat"></span></h4>
+    <div class="toolbar">
+      <button class="btn" id="cap-toggle" onclick="capToggle()">&#10073;&#10073; PAUSE</button>
+      <button class="btn ghost" onclick="capClear()">CLEAR VIEW</button>
+      <input id="cap-filter" class="filter" placeholder="filter: beacon / deauth / data / mac / ssid…" oninput="capRender()">
+      <span class="muted">click a frame to dissect</span>
+    </div>
+    <div class="tablewrap pkt-list"><table>
+      <thead><tr><th>No.</th><th>Time</th><th>Ch</th><th>RSSI</th><th>Type</th><th>Source</th><th>Destination</th><th>Len</th><th>Info</th></tr></thead>
+      <tbody id="cap-rows"></tbody>
+    </table></div>
+    <div class="pkt-detail">
+      <div class="pkt-tree" id="cap-tree">// select a frame above to dissect its 802.11 fields</div>
+      <div class="pkt-hex" id="cap-hex">// hex / ascii dump</div>
+    </div>
+
+    <h4 class="muted">&#9888; WATCHLIST &mdash; malicious / surveillance MAC &amp; OUI</h4>
+    <div class="toolbar">
+      <input id="w-mac" class="filter" placeholder="MAC or OUI e.g. AC:CC:8E">
+      <input id="w-label" class="filter" placeholder="label e.g. Axis camera">
+      <button class="btn" onclick="watchAdd()">ADD</button>
+      <span class="muted">matches raise a WATCHLIST alert on the WarSniffer</span>
+    </div>
+    <div class="tablewrap" style="max-height:24vh"><table>
+      <thead><tr><th>MAC / OUI</th><th>Label</th><th></th></tr></thead>
+      <tbody id="w-rows"></tbody>
     </table></div>
   </section>
 
@@ -329,12 +370,145 @@ function gatt(mac,addrType){
   document.getElementById("bd-gatt").textContent="GATT enumeration queued for "+mac+" — result appears here in ~10s...";
 }
 
+// ===========================================================================
+//  Live capture (Wireshark-style) — incremental fetch + 802.11 dissector
+// ===========================================================================
+var capPkts=[], capLastSeq=0, capPaused=false, capSel=null;
+var CAP_MAX=600;
+var MGMT={0:"Assoc Req",1:"Assoc Resp",2:"Reassoc Req",3:"Reassoc Resp",4:"Probe Req",
+  5:"Probe Resp",8:"Beacon",9:"ATIM",10:"Disassoc",11:"Auth",12:"Deauth",13:"Action"};
+var CTRLT={8:"Block Ack Req",9:"Block Ack",10:"PS-Poll",11:"RTS",12:"CTS",13:"ACK",14:"CF-End"};
+var DATAT={0:"Data",4:"Null",8:"QoS Data",12:"QoS Null",6:"CF-Poll",7:"CF-Ack/Poll"};
+
+function capToggle(){ capPaused=!capPaused;
+  document.getElementById("cap-toggle").innerHTML=capPaused?"&#9658; RESUME":"&#10073;&#10073; PAUSE"; }
+function capClear(){ capPkts=[]; capSel=null;
+  document.getElementById("cap-rows").innerHTML="";
+  document.getElementById("cap-tree").textContent="// select a frame above to dissect";
+  document.getElementById("cap-hex").textContent="// hex / ascii dump"; capRender(); }
+
+function hb(s){ var a=[]; for(var i=0;i+1<s.length;i+=2) a.push(parseInt(s.substr(i,2),16)); return a; }
+function macAt(b,o){ if(b.length<o+6) return ""; var p=[];
+  for(var i=0;i<6;i++) p.push(("0"+b[o+i].toString(16)).slice(-2)); return p.join(":").toUpperCase(); }
+function ssidAt(b,o){ if(b.length>o+1 && b[o]===0){ var l=b[o+1];
+  if(l>0&&l<=32&&b.length>=o+2+l){ var s=""; for(var i=0;i<l;i++){var c=b[o+2+i];
+    s+=(c>=32&&c<127)?String.fromCharCode(c):"."; } return s; } } return null; }
+
+function decode(p){
+  var b=hb(p.data||""); var d={b:b,cls:"pk-ctrl",name:"?",info:"",src:"",dst:"",bssid:""};
+  if(b.length<2){ d.name="(truncated)"; return d; }
+  var fc=b[0]|(b[1]<<8);
+  d.fc=fc; d.ver=fc&3; d.type=(fc>>2)&3; d.sub=(fc>>4)&0xF;
+  d.toDS=!!(fc&0x100); d.fromDS=!!(fc&0x200); d.retry=!!(fc&0x800); d.prot=!!(fc&0x4000);
+  d.a1=macAt(b,4); d.a2=macAt(b,10); d.a3=macAt(b,16);
+  if(d.type===0){ d.name=MGMT[d.sub]||("Mgmt "+d.sub);
+    d.cls=(d.sub===12||d.sub===10)?"pk-deauth":(d.sub===8?"pk-beacon":"pk-mgmt"); }
+  else if(d.type===1){ d.name=CTRLT[d.sub]||("Ctrl "+d.sub); d.cls="pk-ctrl"; }
+  else if(d.type===2){ d.name=DATAT[d.sub]||("Data "+d.sub); d.cls="pk-data"; }
+  d.src=d.a2; d.dst=d.a1; d.bssid=d.a3;
+  var info=d.name;
+  if(d.type===0 && (d.sub===8||d.sub===5)){ var s=ssidAt(b,36); if(s!==null) info+=' SSID="'+s+'"'; }
+  else if(d.type===0 && d.sub===4){ var s=ssidAt(b,24); info+=' SSID="'+(s||"<any>")+'"'; }
+  if(d.prot) info+=" [protected]";
+  d.info=info;
+  return d;
+}
+
+function capMatch(d,p,f){ if(!f) return true; f=f.toLowerCase();
+  return ((d.name+" "+d.src+" "+d.dst+" "+d.bssid+" "+d.info+" ch"+p.ch).toLowerCase()).indexOf(f)>=0; }
+
+function capRender(){
+  var f=document.getElementById("cap-filter").value.trim();
+  var start=capPkts.length?capPkts[0]._rx:0, html="", shown=0;
+  for(var i=0;i<capPkts.length;i++){ var p=capPkts[i], d=decode(p);
+    if(!capMatch(d,p,f)) continue; shown++;
+    var t=((p._rx-start)/1000).toFixed(2);
+    html+="<tr class='"+(capSel===p.seq?"sel":"")+"' onclick='capSelect("+p.seq+")'>"
+      +"<td>"+p.seq+"</td><td>"+t+"</td><td>"+p.ch+"</td><td>"+p.rssi+"</td>"
+      +"<td class='"+d.cls+"'>"+esc(d.name)+"</td><td>"+esc(d.src)+"</td><td>"+esc(d.dst)+"</td>"
+      +"<td>"+p.len+"</td><td class='"+d.cls+"'>"+esc(d.info)+"</td></tr>"; }
+  document.getElementById("cap-rows").innerHTML=html||'<tr><td colspan=9 class="empty">no frames captured yet — is the WarSniffer online and capturing?</td></tr>';
+  document.getElementById("cap-stat").textContent="("+shown+"/"+capPkts.length+" frames)";
+}
+
+function hexdump(b){ var out="";
+  for(var o=0;o<b.length;o+=16){ var h="",a="";
+    for(var i=0;i<16;i++){ if(o+i<b.length){ var v=b[o+i];
+      h+=("0"+v.toString(16)).slice(-2)+" "; a+=(v>=32&&v<127)?String.fromCharCode(v):"."; }
+      else h+="   "; if(i===7) h+=" "; }
+    out+=("000"+o.toString(16)).slice(-4)+"  "+h+" "+a+"\n"; }
+  return out; }
+
+function capSelect(seq){ capSel=seq; var p=null;
+  for(var i=0;i<capPkts.length;i++) if(capPkts[i].seq===seq){p=capPkts[i];break;}
+  if(!p) return; var d=decode(p), b=d.b, tn=[];
+  tn.push("Frame "+p.seq+": "+p.len+" bytes on air, "+b.length+" captured");
+  tn.push("  Channel "+p.ch+"   RSSI "+p.rssi+" dBm");
+  tn.push("IEEE 802.11  "+d.name);
+  if(d.fc!=null){
+    tn.push("  Frame Control: 0x"+("000"+d.fc.toString(16)).slice(-4));
+    tn.push("    Version "+d.ver+"   Type "+d.type+"   Subtype "+d.sub);
+    var fl=(d.toDS?"toDS ":"")+(d.fromDS?"fromDS ":"")+(d.retry?"retry ":"")+(d.prot?"protected ":"");
+    tn.push("    Flags: "+(fl||"none"));
+    if(b.length>=4) tn.push("  Duration: "+(b[2]|(b[3]<<8)));
+    if(d.a1) tn.push("  Address 1 (RA/dst): "+d.a1);
+    if(d.a2) tn.push("  Address 2 (TA/src): "+d.a2);
+    if(d.a3) tn.push("  Address 3 (BSSID):  "+d.a3);
+    if(d.type===0&&(d.sub===8||d.sub===5)){ var s=ssidAt(b,36); if(s!==null) tn.push("  SSID: "+s); }
+  }
+  document.getElementById("cap-tree").textContent=tn.join("\n");
+  document.getElementById("cap-hex").textContent=hexdump(b);
+  capRender();
+}
+
+function pollPackets(){
+  if(capPaused){ setTimeout(pollPackets,1500); return; }
+  fetch("/api/packets?since="+capLastSeq).then(function(r){return r.json();}).then(function(j){
+    if(j.packets && j.packets.length){ var now=Date.now();
+      j.packets.forEach(function(p){ p._rx=now; capPkts.push(p); });
+      if(capPkts.length>CAP_MAX) capPkts=capPkts.slice(capPkts.length-CAP_MAX);
+      capRender(); }
+    if(typeof j.last==="number") capLastSeq=Math.max(capLastSeq,j.last);
+  }).catch(function(){}).finally(function(){ setTimeout(pollPackets,1500); });
+}
+
+// ===========================================================================
+//  Watchlist editor
+// ===========================================================================
+function watchList(){
+  fetch("/api/watch").then(function(r){return r.json();}).then(function(j){
+    var h="";
+    (j.watch||[]).forEach(function(w){
+      h+="<tr><td class='pk-deauth'>"+esc(w.mac)+"</td><td>"+esc(w.label||"")+"</td>"
+        +"<td><button class='btn stop' onclick=\"watchRm('"+esc(w.mac)+"')\">DEL</button></td></tr>"; });
+    document.getElementById("w-rows").innerHTML=h||'<tr><td colspan=3 class="empty">watchlist empty — add a MAC or OUI</td></tr>';
+  }).catch(function(){});
+}
+function watchAdd(){
+  var mac=document.getElementById("w-mac").value.trim();
+  var label=document.getElementById("w-label").value.trim();
+  if(!mac){ toast("enter a MAC or OUI",true); return; }
+  fetch("/api/watch",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({op:"add",mac:mac,label:label})})
+    .then(function(r){ if(r.ok){ toast("watchlist updated");
+        document.getElementById("w-mac").value=""; document.getElementById("w-label").value="";
+        watchList(); } else toast("invalid MAC/OUI, duplicate, or list full",true); })
+    .catch(function(){ toast("C2 unreachable",true); });
+}
+function watchRm(mac){
+  fetch("/api/watch",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({op:"del",mac:mac})})
+    .then(function(){ toast("removed "+mac); watchList(); }).catch(function(){});
+}
+
 function poll(){
   fetch("/api/data").then(function(r){return r.json();})
     .then(render).catch(function(){})
     .finally(function(){ setTimeout(poll, 2000); });
 }
 poll();
+pollPackets();
+watchList();
 </script>
 </body>
 </html>

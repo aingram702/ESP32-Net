@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <ESPmDNS.h>
+#include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include "config.h"
@@ -89,6 +90,30 @@ static GpsSnap g_gps;
 // Surfaced on the dashboard's BlueDriver tab; cleared on a BlueDriver "clear".
 static char     g_gattJson[MAX_GATT_BYTES] = {0};
 static uint32_t g_gattMs = 0;
+
+// Live capture ring: recent 802.11 frames reported by the WarSniffer. Served
+// incrementally to the dashboard's Wireshark-style view via /api/packets.
+struct CapPkt {
+  uint32_t seq;          // monotonic id (dashboard fetches "since" the last seq)
+  uint32_t tMs;          // C2 arrival time
+  uint8_t  ch;
+  int8_t   rssi;
+  uint16_t len;          // length on air
+  uint8_t  caplen;       // bytes actually stored
+  uint8_t  data[PKT_SNAPLEN];
+};
+static CapPkt   g_pkt[PKT_RING];
+static int      g_pktHead = 0, g_pktCount = 0;
+static uint32_t g_pktSeq  = 0;
+
+// Malicious-device / surveillance watchlist. Edited from the dashboard, pushed
+// to the WarSniffer (version handshake), and persisted to LittleFS.
+struct WatchEnt { char mac[18]; char label[24]; };   // mac "AA:BB:CC" (OUI) or full
+static WatchEnt g_watch[MAX_WATCH];
+static int      g_watchN   = 0;
+static uint32_t g_watchVer = 1;          // bumped on every edit
+static uint32_t g_wsWatchSeen = 0;       // watchVer the WarSniffer last reported
+static bool     g_fsOk     = false;
 
 // ---------------------------------------------------------------------------
 //  Per-node link state + outbound command queue (epoch + monotonic ids)
@@ -250,7 +275,111 @@ static void clearMirror(const char* target) {
   else if (!strcmp(target, "bluedriver")) { g_bleN = 0; g_gattJson[0] = 0; g_gattMs = 0; }
   else if (!strcmp(target, "warsniffer")) {
     g_sapN = 0; g_altN = 0; g_prbN = 0; g_frames = SniffFrames{0}; g_sniffDrop = 0;
+    g_pktHead = 0; g_pktCount = 0;     // drop buffered capture (seq stays monotonic)
   }
+}
+
+// ---------------------------------------------------------------------------
+//  Live capture ring + hex helpers
+// ---------------------------------------------------------------------------
+static uint8_t hexNib(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return 0;
+}
+static uint8_t hexToBytes(const char* hex, uint8_t* out, uint8_t maxn) {
+  uint8_t n = 0;
+  while (hex[0] && hex[1] && n < maxn) { out[n++] = (hexNib(hex[0]) << 4) | hexNib(hex[1]); hex += 2; }
+  return n;
+}
+static void pushPkt(uint8_t ch, int8_t rssi, uint16_t len, const uint8_t* data, uint8_t caplen) {
+  int slot;
+  if (g_pktCount < PKT_RING) { slot = (g_pktHead + g_pktCount) % PKT_RING; g_pktCount++; }
+  else { slot = g_pktHead; g_pktHead = (g_pktHead + 1) % PKT_RING; }   // overwrite oldest
+  CapPkt& c = g_pkt[slot];
+  c.seq = ++g_pktSeq; c.tMs = millis(); c.ch = ch; c.rssi = rssi; c.len = len;
+  c.caplen = caplen > PKT_SNAPLEN ? PKT_SNAPLEN : caplen;
+  memcpy(c.data, data, c.caplen);
+}
+
+// ---------------------------------------------------------------------------
+//  Watchlist (MAC/OUI) — edited from the dashboard, pushed to the WarSniffer,
+//  persisted to LittleFS.
+// ---------------------------------------------------------------------------
+// Validate + upper-case a MAC ("AA:BB:CC" OUI or full 6-octet MAC).
+static bool watchNorm(const char* in, char* out, size_t n) {
+  unsigned b[6];
+  if (sscanf(in, "%02x:%02x:%02x:%02x:%02x:%02x",
+             &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) == 6) {
+    snprintf(out, n, "%02X:%02X:%02X:%02X:%02X:%02X", b[0],b[1],b[2],b[3],b[4],b[5]);
+    return true;
+  }
+  if (sscanf(in, "%02x:%02x:%02x", &b[0],&b[1],&b[2]) == 3) {
+    snprintf(out, n, "%02X:%02X:%02X", b[0],b[1],b[2]);
+    return true;
+  }
+  return false;
+}
+static void watchSave() {
+  if (!g_fsOk) return;
+  File f = LittleFS.open(WATCH_PATH, "w");
+  if (!f) return;
+  for (int i = 0; i < g_watchN; i++) f.printf("%s,%s\n", g_watch[i].mac, g_watch[i].label);
+  f.close();
+}
+static bool watchAdd(const char* mac, const char* label) {
+  char norm[18];
+  if (!watchNorm(mac, norm, sizeof(norm))) return false;
+  for (int i = 0; i < g_watchN; i++) if (!strcasecmp(g_watch[i].mac, norm)) return false;  // dup
+  if (g_watchN >= MAX_WATCH) return false;
+  WatchEnt& w = g_watch[g_watchN++];
+  strncpy(w.mac, norm, sizeof(w.mac)-1); w.mac[sizeof(w.mac)-1] = 0;
+  // labels are stored unquoted in CSV and emitted raw in JSON; strip separators
+  // and JSON-breaking characters so both stay well-formed.
+  size_t j = 0;
+  for (const char* p = label ? label : ""; *p && j < sizeof(w.label)-1; p++)
+    if (*p != ',' && *p != '\n' && *p != '\r' && *p != '"' && *p != '\\' && (uint8_t)*p >= 0x20)
+      w.label[j++] = *p;
+  w.label[j] = 0;
+  g_watchVer++;
+  return true;
+}
+static bool watchDel(const char* mac) {
+  char norm[18];
+  if (!watchNorm(mac, norm, sizeof(norm))) return false;
+  for (int i = 0; i < g_watchN; i++) if (!strcasecmp(g_watch[i].mac, norm)) {
+    for (int k = i; k < g_watchN - 1; k++) g_watch[k] = g_watch[k+1];
+    g_watchN--; g_watchVer++;
+    return true;
+  }
+  return false;
+}
+static void watchLoad() {
+  if (!g_fsOk) return;
+  File f = LittleFS.open(WATCH_PATH, "r");
+  if (!f) return;
+  g_watchN = 0;
+  while (f.available() && g_watchN < MAX_WATCH) {
+    String line = f.readStringUntil('\n'); line.trim();
+    if (!line.length()) continue;
+    int c = line.indexOf(',');
+    String mac = (c < 0) ? line : line.substring(0, c);
+    String lbl = (c < 0) ? String("") : line.substring(c + 1);
+    char norm[18];
+    if (!watchNorm(mac.c_str(), norm, sizeof(norm))) continue;
+    WatchEnt& w = g_watch[g_watchN++];
+    strncpy(w.mac, norm, sizeof(w.mac)-1); w.mac[sizeof(w.mac)-1] = 0;
+    strncpy(w.label, lbl.c_str(), sizeof(w.label)-1); w.label[sizeof(w.label)-1] = 0;
+  }
+  f.close();
+}
+static void watchSeedDefaults() {
+  // Starter entries (camera/surveillance vendor OUIs). These are examples to
+  // tune for your area — add/remove from the dashboard. Matching is by OUI.
+  watchAdd("AC:CC:8E", "Axis camera");
+  watchAdd("00:40:8C", "Axis camera");
+  watchAdd("00:80:F0", "Panasonic cam?");
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +401,18 @@ static void buildIngestReply(NodeLink* L, String& out) {
     c["cmd"] = L->q[i].cmd;
     if (L->q[i].on != -2) c["on"] = L->q[i].on;
     if (L->q[i].arg[0]) { c["mac"] = L->q[i].arg; c["addrType"] = L->q[i].arg2; }
+  }
+  // Push the malicious-device watchlist to the WarSniffer; send the full list
+  // only when its version is stale (it echoes watchVer in each request).
+  if (L == &L_ws) {
+    doc["watchVer"] = g_watchVer;
+    if (g_wsWatchSeen != g_watchVer) {
+      JsonArray w = doc["watch"].to<JsonArray>();
+      for (int i = 0; i < g_watchN; i++) {
+        JsonObject e = w.add<JsonObject>();
+        e["mac"] = g_watch[i].mac; e["label"] = g_watch[i].label;
+      }
+    }
   }
   serializeJson(doc, out);
 }
@@ -327,9 +468,15 @@ static void handleIngestBody(AsyncWebServerRequest* req) {
     }
     g_sniffCh   = st["channel"] | 0;
     g_sniffDrop = st["dropped"] | 0;
+    g_wsWatchSeen = doc["watchVer"] | 0;        // for the watchlist push handshake
     for (JsonObjectConst o : doc["aps"].as<JsonArrayConst>())    upsertSniffAP(o);
     for (JsonObjectConst o : doc["alerts"].as<JsonArrayConst>()) pushAlert(o);
     for (JsonObjectConst o : doc["probes"].as<JsonArrayConst>()) upsertProbe(o);
+    for (JsonObjectConst o : doc["packets"].as<JsonArrayConst>()) {
+      uint8_t buf[PKT_SNAPLEN];
+      uint8_t cap = hexToBytes(o["data"] | "", buf, PKT_SNAPLEN);
+      pushPkt(o["ch"] | 0, o["rssi"] | (int)-128, o["len"] | 0, buf, cap);
+    }
     snprintf(L->detail, sizeof(L->detail), "ch%u / %u frames",
              (unsigned)g_sniffCh, (unsigned)g_frames.total);
   }
@@ -438,6 +585,56 @@ static void handleExportSniff(AsyncWebServerRequest* req) {
     rs->printf("%u\n", (unsigned)((now - g_sap[i].seenMs) / 1000));
   }
   req->send(rs);
+}
+
+// /api/packets?since=<seq> : incremental live-capture feed for the dashboard's
+// Wireshark-style view. Streamed by hand to avoid a large JsonDocument on the S2.
+static void handlePackets(AsyncWebServerRequest* req) {
+  uint32_t since = 0;
+  if (req->hasParam("since")) since = strtoul(req->getParam("since")->value().c_str(), nullptr, 10);
+  AsyncResponseStream* rs = req->beginResponseStream("application/json");
+  rs->print("{\"packets\":[");
+  bool first = true;
+  for (int k = 0; k < g_pktCount; k++) {
+    int i = (g_pktHead + k) % PKT_RING;
+    if (g_pkt[i].seq <= since) continue;
+    if (!first) rs->print(','); first = false;
+    rs->printf("{\"seq\":%u,\"t\":%u,\"ch\":%u,\"rssi\":%d,\"len\":%u,\"data\":\"",
+               (unsigned)g_pkt[i].seq, (unsigned)g_pkt[i].tMs, (unsigned)g_pkt[i].ch,
+               (int)g_pkt[i].rssi, (unsigned)g_pkt[i].len);
+    for (int j = 0; j < g_pkt[i].caplen; j++) rs->printf("%02x", g_pkt[i].data[j]);
+    rs->print("\"}");
+  }
+  rs->printf("],\"last\":%u}", (unsigned)g_pktSeq);
+  req->send(rs);
+}
+
+// /api/watch : GET the watchlist; POST {op:add|del|clear, mac, label} to edit it.
+static void handleWatchGet(AsyncWebServerRequest* req) {
+  AsyncResponseStream* rs = req->beginResponseStream("application/json");
+  rs->printf("{\"ver\":%u,\"watch\":[", (unsigned)g_watchVer);
+  for (int i = 0; i < g_watchN; i++) {
+    if (i) rs->print(',');
+    rs->print("{\"mac\":\""); rs->print(g_watch[i].mac);
+    rs->print("\",\"label\":\""); rs->print(g_watch[i].label); rs->print("\"}");
+  }
+  rs->print("]}");
+  req->send(rs);
+}
+static void handleWatchBody(AsyncWebServerRequest* req) {
+  BodyBuf* bb = (BodyBuf*) req->_tempObject;
+  if (!bb) { req->send(400, "text/plain", "no body"); return; }
+  JsonDocument doc;
+  DeserializationError e = deserializeJson(doc, bb->data);
+  delete bb; req->_tempObject = nullptr;
+  if (e) { req->send(400, "text/plain", "bad json"); return; }
+  const char* op = doc["op"] | "";
+  bool ok = false;
+  if      (!strcmp(op, "add"))   ok = watchAdd(doc["mac"] | "", doc["label"] | "");
+  else if (!strcmp(op, "del"))   ok = watchDel(doc["mac"] | "");
+  else if (!strcmp(op, "clear")) { g_watchN = 0; g_watchVer++; ok = true; }
+  if (ok) watchSave();
+  req->send(ok ? 200 : 400, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0}");
 }
 
 // /api/data : full snapshot for the dashboard
@@ -560,6 +757,16 @@ void setup() {
   L_ws.epoch = (esp_random() | 1);
   L_bd.epoch = (esp_random() | 1);
 
+  // Mount LittleFS and load the persisted watchlist (seed defaults if empty).
+  g_fsOk = LittleFS.begin(true);
+  if (g_fsOk) {
+    watchLoad();
+    if (g_watchN == 0) { watchSeedDefaults(); watchSave(); }
+  } else {
+    Serial.println("[C2] LittleFS mount failed — watchlist not persisted");
+    watchSeedDefaults();
+  }
+
   startAP();
 
   if (MDNS.begin(MDNS_HOST)) {
@@ -573,11 +780,14 @@ void setup() {
     r->send(resp);
   });
   server.on("/api/data", HTTP_GET, handleData);
+  server.on("/api/packets", HTTP_GET, handlePackets);
+  server.on("/api/watch", HTTP_GET, handleWatchGet);
   server.on("/api/export/wifi",  HTTP_GET, handleExportWiFi);
   server.on("/api/export/ble",   HTTP_GET, handleExportBLE);
   server.on("/api/export/sniff", HTTP_GET, handleExportSniff);
   server.on(INGEST_PATH, HTTP_POST, handleIngestBody, nullptr, bodyCollector);
   server.on("/api/cmd", HTTP_POST, handleCmdBody, nullptr, bodyCollector);
+  server.on("/api/watch", HTTP_POST, handleWatchBody, nullptr, bodyCollector);
 
   server.onNotFound([](AsyncWebServerRequest* r) {
     // captive-portal style: bounce everything to the dashboard

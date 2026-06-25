@@ -39,10 +39,22 @@ struct AlertRec { char type[16]; uint8_t bssid[6]; char detail[40]; uint32_t tMs
 // passive: these are SSIDs nearby devices actively broadcast that they remember.
 struct ProbeReq { char ssid[33]; uint16_t hits; uint32_t lastMs; bool used; };
 
+// Live packet capture: a small per-window buffer of raw frame prefixes shipped
+// to the C2 for the Wireshark-style dashboard view.
+struct CapPkt { uint8_t ch; int8_t rssi; uint16_t len; uint8_t caplen; uint8_t data[CAP_SNAPLEN]; };
+// Watchlist: MAC/OUI entries (len 3 = OUI match, 6 = full-MAC match) pushed from
+// the C2 so we can flag known malicious / surveillance devices on sight.
+struct WatchEnt { uint8_t mac[6]; uint8_t len; char label[24]; };
+struct WatchHit { uint8_t mac[6]; };
+
 static ApInfo   g_aps[MAX_APS];
 static StaInfo  g_stas[MAX_STAS]; static int g_staN = 0;
 static AlertRec g_alerts[MAX_ALERTS]; static int g_alertHead = 0, g_alertCnt = 0;
 static ProbeReq g_probes[MAX_PROBES]; static int g_probeN = 0;
+static CapPkt   g_cap[CAP_RING];      static int g_capN = 0;     // buffered this window
+static WatchEnt g_watch[MAX_WATCH];   static int g_watchN = 0;
+static WatchHit g_whits[MAX_WATCH_HITS]; static int g_whitN = 0;
+static uint32_t g_watchVer = 0;       // version of the watchlist we hold
 
 static volatile uint32_t cTotal=0,cMgmt=0,cCtrl=0,cData=0,
                          cBeacon=0,cProbe=0,cDeauth=0,cEapol=0,cDropped=0;
@@ -59,6 +71,7 @@ static volatile bool g_capturing = true;
 static bool     g_hop       = true;
 static uint8_t  g_channel   = CHANNEL_MIN;
 static uint32_t g_bootMs    = 0;
+static uint32_t g_lastReportOkMs = 0;   // for the reboot watchdog
 
 // C2 link bookkeeping (epoch + command ack)
 static uint32_t g_linkEpoch = 0;
@@ -141,6 +154,43 @@ static void addAlert(const char* type, const uint8_t* bssid, const char* detail)
   r.tMs = millis();
   if (g_alertCnt < MAX_ALERTS) g_alertCnt++;
   else g_alertHead = (g_alertHead + 1) % MAX_ALERTS;   // overwrite oldest
+}
+
+// Return the watchlist label for a MAC (OUI or full match), or nullptr.
+// Caller holds g_mux.
+static const char* watchMatch(const uint8_t* mac) {
+  for (int i = 0; i < g_watchN; i++) {
+    uint8_t n = g_watch[i].len ? g_watch[i].len : 6;
+    if (memcmp(g_watch[i].mac, mac, n) == 0) return g_watch[i].label;
+  }
+  return nullptr;
+}
+// Raise a WATCHLIST alert the first time a matching MAC is seen (dedupe so a
+// chatty device doesn't flood the alert log). Caller holds g_mux.
+static void noteWatch(const uint8_t* mac) {
+  if (g_watchN == 0) return;
+  const char* label = watchMatch(mac);
+  if (!label) return;
+  for (int i = 0; i < g_whitN; i++) if (macEq(g_whits[i].mac, mac)) return;  // already alerted
+  if (g_whitN < MAX_WATCH_HITS) { memcpy(g_whits[g_whitN].mac, mac, 6); g_whitN++; }
+  char det[40]; snprintf(det, sizeof(det), "%.31s", label);
+  addAlert("WATCHLIST", mac, det);
+}
+
+// Buffer a raw frame prefix for the live capture view. Time-gated so the buffer
+// spreads across the sniff window (multiple channels) instead of filling from
+// the first burst. Caller holds g_mux.
+static uint32_t g_lastCapMs = 0;
+static void capturePkt(const uint8_t* p, int len, uint8_t ch, int8_t rssi) {
+  if (g_capN >= CAP_RING) return;                 // window buffer full; ship first
+  uint32_t now = millis();
+  if (g_capN > 0 && now - g_lastCapMs < CAP_INTERVAL_MS) return;
+  g_lastCapMs = now;
+  CapPkt& c = g_cap[g_capN++];
+  c.ch = ch; c.rssi = rssi; c.len = (uint16_t)len;
+  uint8_t cap = len < CAP_SNAPLEN ? (uint8_t)len : CAP_SNAPLEN;
+  c.caplen = cap;
+  memcpy(c.data, p, cap);
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +294,15 @@ static void IRAM_ATTR sniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
       if (llc[0]==0xAA && llc[1]==0xAA && llc[6]==0x88 && llc[7]==0x8E) cEapol++;
     }
   }
+
+  // Watchlist: flag known malicious / surveillance MACs (transmitter + BSSID).
+  if (g_watchN) {
+    if (addr2) noteWatch(addr2);
+    if (addr3 && (!addr2 || !macEq(addr3, addr2))) noteWatch(addr3);
+  }
+  // Buffer this frame for the live Wireshark-style capture view.
+  capturePkt(p, len, ch, rssi);
+
   portEXIT_CRITICAL_ISR(&g_mux);
 }
 
@@ -251,8 +310,13 @@ static void IRAM_ATTR sniffCb(void* buf, wifi_promiscuous_pkt_type_t type) {
 //  Capture control
 // ---------------------------------------------------------------------------
 static void startSniffer() {
+  // STA mode (not NULL) gives a reliably-started driver for promiscuous mode —
+  // with NULL mode the driver can be stopped and promiscuous silently captures
+  // nothing. We never associate here, so the STA just parks on the set channel.
   WiFi.disconnect(true, false);
-  WiFi.mode(WIFI_MODE_NULL);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  delay(10);                       // let the mode change settle before promiscuous
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&sniffCb);
   esp_wifi_set_channel(g_channel, WIFI_SECOND_CHAN_NONE);
@@ -282,6 +346,8 @@ static void clearStore() {
   for (int i = 0; i < MAX_STAS; i++) g_stas[i].used = false;
   g_alertHead = g_alertCnt = 0;
   g_probeN = 0;
+  g_capN = 0;
+  g_whitN = 0;            // forget watchlist hits so they can re-alert
   cTotal=cMgmt=cCtrl=cData=cBeacon=cProbe=cDeauth=cEapol=cDropped=0;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -304,10 +370,39 @@ static void applyCommands(JsonArrayConst cmds) {
   }
 }
 
+// Replace the in-RAM watchlist with one pushed from the C2. Safe to mutate
+// without the lock: the promiscuous sniffer (the only other reader) is stopped
+// during the report cycle in which this runs.
+static void applyWatchlist(JsonArrayConst arr, uint32_t ver) {
+  g_watchN = 0;
+  for (JsonObjectConst e : arr) {
+    if (g_watchN >= MAX_WATCH) break;
+    const char* mac = e["mac"] | "";
+    unsigned b[6] = {0}; uint8_t len = 0;
+    int got = sscanf(mac, "%02x:%02x:%02x:%02x:%02x:%02x",
+                     &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]);
+    if (got == 3)      len = 3;          // OUI prefix
+    else if (got == 6) len = 6;          // full MAC
+    else continue;
+    WatchEnt& w = g_watch[g_watchN++];
+    for (int i = 0; i < 6; i++) w.mac[i] = (uint8_t)b[i];
+    w.len = len;
+    strncpy(w.label, e["label"] | "", sizeof(w.label)-1); w.label[sizeof(w.label)-1]=0;
+  }
+  g_watchVer = ver;
+  g_whitN = 0;                            // re-evaluate hits against the new list
+}
+
+static void hexAppend(String& s, const uint8_t* d, int n) {
+  static const char* H = "0123456789abcdef";
+  for (int i = 0; i < n; i++) { s += H[d[i] >> 4]; s += H[d[i] & 0xF]; }
+}
+
 static void reportToC2() {
   stopSniffer();
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(C2_SSID, C2_PASSWORD);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) delay(100);
@@ -319,6 +414,7 @@ static void reportToC2() {
   doc["ver"]       = FW_VERSION;
   doc["linkEpoch"] = g_linkEpoch;
   doc["lastCmdId"] = g_lastCmdId;
+  doc["watchVer"]  = g_watchVer;        // C2 re-pushes the watchlist if stale
 
   JsonObject st = doc["status"].to<JsonObject>();
   st["capturing"] = g_capturing ? 1 : 0;
@@ -373,6 +469,17 @@ static void reportToC2() {
   doc["count"] = aps.size();
   portEXIT_CRITICAL(&g_mux);
 
+  // Live capture frames (no lock needed: the sniffer is stopped during report).
+  JsonArray pk = doc["packets"].to<JsonArray>();
+  int npk = g_capN < UPLINK_PKT_MAX ? g_capN : UPLINK_PKT_MAX;
+  for (int i = 0; i < npk; i++) {
+    JsonObject o = pk.add<JsonObject>();
+    o["ch"] = g_cap[i].ch; o["rssi"] = g_cap[i].rssi; o["len"] = g_cap[i].len;
+    String hx; hexAppend(hx, g_cap[i].data, g_cap[i].caplen);
+    o["data"] = hx;
+  }
+  g_capN = 0;                          // window buffer drained
+
   String body; serializeJson(doc, body);
 
   HTTPClient http; WiFiClient client;
@@ -381,12 +488,16 @@ static void reportToC2() {
     http.addHeader("Content-Type", "application/json");
     int code = http.POST(body);
     if (code == 200) {
+      g_lastReportOkMs = millis();          // feed the reboot watchdog
       String resp = http.getString();
       JsonDocument rd;
       if (!deserializeJson(rd, resp)) {
         uint32_t newEpoch = rd["epoch"] | 0;
         if (newEpoch && newEpoch != g_linkEpoch) { g_linkEpoch = newEpoch; g_lastCmdId = 0; }
         applyCommands(rd["commands"].as<JsonArrayConst>());
+        // Watchlist push: the C2 includes the full list only when ours is stale.
+        if (rd["watch"].is<JsonArrayConst>())
+          applyWatchlist(rd["watch"].as<JsonArrayConst>(), rd["watchVer"] | 0);
       }
     }
     http.end();
@@ -404,6 +515,7 @@ void setup() {
   delay(300);
   Serial.println("\nESP32-WarSniffer node booting (passive monitor + WIDS)...");
   g_bootMs = millis();
+  g_lastReportOkMs = millis();      // grace period before the watchdog can fire
   setLed(0, 0, 16);                 // boot: dim blue
   WiFi.persistent(false);
   startSniffer();
@@ -431,6 +543,13 @@ void loop() {
   // ---- REPORT phase ----
   setLed(0, 0, 48);                            // blue: associating + POSTing
   reportToC2();
+
+  // reboot watchdog: if the C2 has been unreachable far too long, the WiFi/
+  // promiscuous stack may be wedged — restart clean.
+  if (millis() - g_lastReportOkMs > WIFI_WATCHDOG_MS) {
+    Serial.println("[WS] no C2 contact too long — rebooting");
+    delay(50); ESP.restart();
+  }
 
   static uint32_t hb = 0;
   if (millis() - hb > 1000) {

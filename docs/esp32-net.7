@@ -73,8 +73,11 @@ to the coordinator.
 Passive 802.11 monitor + WIDS. Target: ESP32\-S3\-DevKitC\-1 (N16R8). Channel\-hops
 1\(en13 in promiscuous mode, tallies frame types, builds an AP/STA inventory,
 harvests directed probe\-request SSIDs (client preferred\-network lists), and
-raises deauth\-flood, beacon\-flood, and evil\-twin detections. Reports metadata
-only.
+raises deauth\-flood, beacon\-flood, and evil\-twin detections. Buffers a sampled
+live capture of raw frame prefixes for the dashboard's Wireshark\-style packet
+view (list + decoded fields + hex/ASCII dump), and matches every frame against a
+customizable MAC/OUI watchlist (pushed from the C2) to flag malicious or
+surveillance devices.
 .TP
 .B bluedriver-node
 BLE scanner. Target: ESP32\-S3\-DevKitC\-1 (N16R8). Continuous passive or active
@@ -172,6 +175,17 @@ The dashboard (HTML).
 .TP
 .B GET /api/data
 Full aggregate snapshot as JSON; polled by the dashboard.
+.TP
+.B GET /api/packets?since=<seq>
+Incremental live\-capture feed: WarSniffer frames with a sequence id greater than
+.IR seq ,
+each as channel, RSSI, on\-air length, and a hex prefix. Powers the dashboard's
+Wireshark\-style view.
+.TP
+.B GET /api/watch, POST /api/watch
+Read or edit the MAC/OUI watchlist. POST body:
+.BR {"op":"add|del|clear","mac":"AA:BB:CC","label":"..."} .
+The list is persisted on the C2 and pushed to the WarSniffer.
 .TP
 .B POST /api/cmd
 Queue a control command. Body:

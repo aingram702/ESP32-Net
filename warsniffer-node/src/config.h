@@ -21,9 +21,28 @@
 #define FW_VERSION     "1.0.0"
 
 // ---- Capture / report cadence (interleaved: can't sniff + associate at once)
-#define SNIFF_WINDOW_MS   8000     // listen in promiscuous mode for this long...
+#define SNIFF_WINDOW_MS   6000     // listen in promiscuous mode for this long...
 #define REPORT_BUDGET_MS  6000     // ...then associate to C2, POST, max time
 #define WIFI_CONNECT_MS   6000     // STA connect timeout per report cycle
+
+// ---- Reliability / self-healing watchdog -----------------------------------
+#define WIFI_WATCHDOG_MS  60000    // no successful C2 report this long -> reboot
+
+// ---- Live packet capture (Wireshark-style) ---------------------------------
+// Frames are buffered during the sniff window and shipped to the C2 each report,
+// where the dashboard renders a live packet list + hex/ASCII detail. SNAPLEN is
+// how many bytes of each frame we keep (enough for the 802.11 header + a slice
+// of payload). Kept small to bound RAM and POST size.
+#define CAP_SNAPLEN       80       // bytes captured per frame
+#define CAP_RING          24       // frames buffered per sniff window
+#define UPLINK_PKT_MAX    24       // frames shipped per POST
+#define CAP_INTERVAL_MS   200      // min gap between captures (spreads across channels)
+
+// ---- Malicious-device / surveillance watchlist -----------------------------
+// MAC/OUI watchlist (pushed from the C2 dashboard). Matching frames raise a
+// WATCHLIST alert labelled with the entry name (e.g. a surveillance-camera OUI).
+#define MAX_WATCH         32       // watchlist entries held on the node
+#define MAX_WATCH_HITS    48       // distinct matched MACs (alert dedupe)
 
 // ---- Channel hopping -------------------------------------------------------
 #define CHANNEL_MIN        1

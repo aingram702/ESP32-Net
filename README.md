@@ -178,21 +178,29 @@ RFC-4180-quoted so a comma in a network name can't shift the CSV columns.
 
 ### WarSniffer — passive 802.11 monitor + WIDS
 
-Channel-hops 1–13 in promiscuous mode and reports **metadata only**.
+Channel-hops 1–13 in promiscuous mode.
 
 **Does:**
 - Count frame types (mgmt / ctrl / data / beacon / probe / deauth / EAPOL).
 - Build an AP + client-count inventory from beacon and data frames.
+- **Live packet capture (Wireshark-style).** Buffers raw frame prefixes
+  (first 80 bytes) sampled across the sniff window and ships them to the C2,
+  where the dashboard renders a live packet list and a click-to-dissect view
+  with a decoded-802.11 field pane and a hex/ASCII dump — read frames the way you
+  would in Wireshark, with the project's green-on-black vibe.
+- **Malicious-device / surveillance watchlist.** A customizable list of MACs and
+  OUIs (edited from the dashboard, persisted on the C2, pushed to the node) that
+  raises a labelled `WATCHLIST` alert the moment a matching device is seen.
 - **Harvest directed probe-request SSIDs** — the preferred-network lists devices
-  broadcast while hunting for remembered APs. Useful client profiling, fully
-  passive (it only listens; it never answers a probe).
+  broadcast while hunting for remembered APs. Fully passive (it only listens).
 - Raise WIDS alerts: **deauth flood** (>20/s), **beacon flood** (>40 unique
   SSIDs/s), **evil-twin** (same SSID, new BSSID, ≥25 dBm RSSI delta).
 
 **Does not:**
 - Transmit anything on the monitored band (no deauth, no injection, no rogue AP).
 - Store EAPOL/WPA handshake payloads (EAPOL frames are *counted* only).
-- Write PCAPs to flash.
+- Write PCAPs to flash — the capture view is a bounded, live sample of recent
+  frame prefixes, not a full on-flash packet log.
 
 ### BlueDriver — BLE scanner + GATT
 
@@ -224,7 +232,7 @@ to nodes in their next `/ingest` response.
 |---|---|
 | **OVERVIEW** | Per-node online/offline state, uptime, free heap, aggregate counts |
 | **WARDRIVER** | AP table (BSSID, SSID, channel, encryption, RSSI, vendor, threat flag) + GPS fix |
-| **WARSNIFFER** | Frame-type counters, AP/STA inventory, WIDS alert log, harvested probe SSIDs |
+| **WARSNIFFER** | Frame-type counters, AP/STA inventory, WIDS alert log, harvested probe SSIDs, a **Wireshark-style live capture** (packet list + click-to-dissect with a decoded-fields pane and a hex/ASCII dump), and a **watchlist editor** |
 | **BLUEDRIVER** | BLE device table (+ mfg company ID); click a row to run GATT, result shown below |
 
 The C2's in-RAM stores **evict least-recently-seen entries once full**, so new
@@ -261,6 +269,8 @@ All endpoints are served by the coordinator on port 80.
 |---|---|
 | `GET /` | The dashboard (HTML) |
 | `GET /api/data` | Full aggregate snapshot (JSON) — polled by the dashboard |
+| `GET /api/packets?since=<seq>` | Incremental live-capture feed (WarSniffer frames) |
+| `GET /api/watch` / `POST /api/watch` | Read / edit the MAC-OUI watchlist |
 | `POST /api/cmd` | Queue a control command for a node |
 | `GET /api/export/wifi` | WarDriver inventory as CSV (incl. GPS lat/lon) |
 | `GET /api/export/ble` | BlueDriver inventory as CSV |
