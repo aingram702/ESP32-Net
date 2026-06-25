@@ -30,6 +30,14 @@
 // Cap on the stored GATT enumeration result (bytes). Keeps S2 heap bounded.
 #define MAX_GATT_BYTES   2048
 
+// ---- Live packet capture (from the WarSniffer) -----------------------------
+#define PKT_RING         64           // recent frames kept for the capture view
+#define PKT_SNAPLEN      80           // bytes stored per frame
+
+// ---- Malicious-device / surveillance watchlist -----------------------------
+#define MAX_WATCH        32           // MAC/OUI watchlist entries
+#define WATCH_PATH       "/watch.csv" // persisted to LittleFS so edits survive reboot
+
 // ---- mDNS ------------------------------------------------------------------
 // Browse to http://esp32net.local/ instead of the IP (where mDNS is supported).
 #define MDNS_HOST      "esp32net"
