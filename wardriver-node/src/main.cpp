@@ -260,6 +260,7 @@ static void applyCommands(JsonArrayConst cmds) {
   for (JsonObjectConst c : cmds) {
     uint32_t id = c["id"] | 0; if (id <= g_lastCmdId) continue;
     const char* cmd = c["cmd"] | ""; bool hasOn = c["on"].is<int>(); int on = hasOn ? (int)c["on"] : -1;
+    Serial.printf("[WD] cmd #%lu %s on=%d\n", (unsigned long)id, cmd, on);
     if      (!strcmp(cmd, "scan"))  g_scanning = hasOn ? (on != 0) : !g_scanning;
     else if (!strcmp(cmd, "clear")) clearStore();
     g_lastCmdId = id;

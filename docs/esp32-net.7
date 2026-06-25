@@ -80,10 +80,12 @@ customizable MAC/OUI watchlist (pushed from the C2) to flag malicious or
 surveillance devices.
 .TP
 .B bluedriver-node
-BLE scanner. Target: ESP32\-S3\-DevKitC\-1 (N16R8). Continuous passive or active
-BLE advertisement scan via NimBLE v2.x, with per\-device inventory and on\-demand
-GATT service/characteristic enumeration. BLE 5.0 only \(em the ESP32\-S3 has no
-Bluetooth Classic.
+BLE scanner. Target: ESP32\-S3\-DevKitC\-1 (N16R8). Passive or active BLE
+advertisement scan via NimBLE v2.x, with per\-device inventory and on\-demand GATT
+service/characteristic enumeration. To keep the uplink reliable it interleaves
+the radios \(em it scans BLE with WiFi off, then stops the scan, brings WiFi up
+only long enough to POST, and resumes scanning (the two are never active at
+once). BLE 5.0 only \(em the ESP32\-S3 has no Bluetooth Classic.
 .SH BUILDING AND FLASHING
 Each component directory is a self\-contained PlatformIO project. From a
 directory:
@@ -319,9 +321,16 @@ in your jurisdiction; you are responsible for compliance. Channel 14 and any
 transmit\(hyrelated configuration must only be enabled where legally permitted.
 .PP
 By design the toolkit does not transmit deauthentication or injection frames,
-does not operate a rogue access point, and does not store raw packet payloads
-or WPA handshakes \(em EAPOL frames are counted, never captured. The SoftAP is
-WPA2\(hyprotected; change the default credentials before any use.
+does not operate a rogue access point, and does not store WPA handshakes \(em
+EAPOL frames are counted, never captured. The SoftAP is WPA2\(hyprotected; change
+the default credentials before any use.
+.PP
+Hardening: the tool ingests attacker\(hycontrollable data (SSIDs, BLE names, raw
+frames). CSV exports are RFC\-4180 quoted and apostrophe\(hyguard leading
+=,+,-,@ to block spreadsheet formula injection; dashboard output is
+HTML\(hyescaped; 802.11 frame parsing is bounds\(hychecked. The HTTP API has no
+per\(hyrequest authentication \(em it trusts the WPA2 SoftAP as its boundary, so
+keep that AP private and do not bridge it.
 .SH SEE ALSO
 .BR curl (1),
 .BR man (1)

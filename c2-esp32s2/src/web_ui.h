@@ -162,6 +162,7 @@ tr:hover td{background:#07261759}
       <button class="btn" onclick="cmd('warsniffer','scan',1)">CAPTURE ON</button>
       <button class="btn stop" onclick="cmd('warsniffer','scan',0)">CAPTURE OFF</button>
       <button class="btn ghost" onclick="cmd('warsniffer','hop',1)">HOP ON</button>
+      <button class="btn ghost" onclick="cmd('warsniffer','hop',0)">HOP OFF</button>
       <button class="btn ghost" onclick="cmd('warsniffer','clear')">CLEAR</button>
       <a class="btn ghost" href="/api/export/sniff" download>EXPORT CSV</a>
       <span class="muted" id="ws-meta">ch: -- &nbsp; frames: --</span>
@@ -238,12 +239,14 @@ tr:hover td{background:#07261759}
 <script>
 "use strict";
 // ---- tab switching --------------------------------------------------------
+var activeTab="overview";
 document.querySelectorAll(".tab").forEach(function(t){
   t.addEventListener("click",function(){
     document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("active");});
     document.querySelectorAll(".panel").forEach(function(x){x.classList.remove("active");});
     t.classList.add("active");
     document.getElementById(t.dataset.p).classList.add("active");
+    activeTab=t.dataset.p;
   });
 });
 
@@ -273,13 +276,20 @@ function cmd(target,c,on){
   var body={target:target,cmd:c};
   if(on!==undefined) body.on=on;
   var label=(c+(on===undefined?"":" "+on)).toUpperCase();
-  fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body)})
-    .then(function(r){
-      if(r.ok) toast("queued: "+target+" "+label+" (applies on next check-in)");
-      else toast("rejected: "+target+" "+label,true);
-    })
-    .catch(function(){ toast("C2 unreachable — command not sent",true); });
+  // Retry transient browser->C2 failures. Once the C2 has the command it keeps
+  // re-sending it until the node acks, so a single successful POST is enough.
+  var attempt=function(n){
+    fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body)})
+      .then(function(r){
+        if(r.ok) toast("queued: "+target+" "+label+" (applies on next check-in)");
+        else if(n>0) setTimeout(function(){attempt(n-1);},400);
+        else toast("rejected: "+target+" "+label,true);
+      })
+      .catch(function(){ if(n>0) setTimeout(function(){attempt(n-1);},400);
+        else toast("C2 unreachable — command not sent",true); });
+  };
+  attempt(2);
 }
 
 function render(d){
@@ -462,7 +472,9 @@ function capSelect(seq){ capSel=seq; var p=null;
 }
 
 function pollPackets(){
-  if(capPaused){ setTimeout(pollPackets,1500); return; }
+  // Only poll while the WarSniffer tab is open and not paused — keeps load off
+  // the single-core C2 so control-command POSTs stay responsive.
+  if(capPaused || activeTab!=="warsniffer"){ setTimeout(pollPackets,1500); return; }
   fetch("/api/packets?since="+capLastSeq).then(function(r){return r.json();}).then(function(j){
     if(j.packets && j.packets.length){ var now=Date.now();
       j.packets.forEach(function(p){ p._rx=now; capPkts.push(p); });

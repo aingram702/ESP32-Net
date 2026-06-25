@@ -362,6 +362,7 @@ static void applyCommands(JsonArrayConst cmds) {
     const char* cmd = c["cmd"] | "";
     bool hasOn = c["on"].is<int>();
     int  on    = hasOn ? (int)c["on"] : -1;
+    Serial.printf("[WS] cmd #%lu %s on=%d\n", (unsigned long)id, cmd, on);
     if      (!strcmp(cmd, "scan"))  g_capturing = hasOn ? (on != 0) : !g_capturing;
     else if (!strcmp(cmd, "hop"))   g_hop       = hasOn ? (on != 0) : !g_hop;
     else if (!strcmp(cmd, "clear")) clearStore();

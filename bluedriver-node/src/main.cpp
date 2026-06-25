@@ -1,22 +1,19 @@
 // ===========================================================================
 //  ESP32-BlueDriver node  —  main.cpp   (ESP32-S3-DevKitC-1 N16R8)
 //
-//  Continuous BLE advertisement scanner + optional GATT enumerator for
-//  authorized penetration testing. WiFi STA connects to the C2 SoftAP and
-//  POSTs device inventory + status to /ingest every REPORT_INTERVAL_MS.
+//  BLE advertisement scanner + optional GATT enumerator for authorized
+//  penetration testing. Reports device inventory to the C2 SoftAP over WiFi.
 //
-//  Architecture:
-//    Core 0 — NimBLE host task (BLE controller + coexistence arbiter)
-//    Core 1 — Arduino loop() — WiFi STA, HTTPClient POST, command dispatch
-//
-//  BLE and WiFi coexist via ESP32-S3 software coexistence (time-division on
-//  the shared 2.4 GHz radio). Scan rate drops ~50% while WiFi is active,
-//  which is acceptable for a continuous passive/active BLE survey.
+//  Architecture (INTERLEAVED — the two radios never run at once, which is what
+//  makes the WiFi link reliable):
+//    - Scan phase: BLE scan runs with WiFi fully off (core 0 NimBLE host task).
+//    - Report phase: stop scan, bring WiFi up, POST to /ingest, drop WiFi,
+//      resume scanning (core 1 Arduino loop()).
 //
 //  Commands received from C2 (via /ingest response):
 //    scan   on:1/0      — start/stop scanning
 //    clear              — wipe device store
-//    config activeScan  — toggle active/passive scan (stops + restarts scan)
+//    config on:1/0      — active(1) / passive(0) scan (stops + restarts scan)
 //    gatt   mac,addrType — connect + enumerate GATT services/chars (~8 s)
 //
 //  ESP32-S3 = BLE 5.0 ONLY. No Bluetooth Classic. Hardware limit.
@@ -55,9 +52,7 @@ static uint32_t g_newCount  = 0;
 static volatile bool g_scanning   = true;
 static volatile bool g_activeScan = DEFAULT_ACTIVE_SCAN;
 
-// Self-healing state for the loop watchdog.
-static uint32_t g_lastReportOkMs = 0;
-static uint32_t g_lastResetMs    = 0;
+static uint32_t g_lastReportOkMs = 0;   // for the reboot watchdog
 
 // Mutex protecting the device store — written from NimBLE task (core 0),
 // read from main loop (core 1).
@@ -344,6 +339,7 @@ static void applyCommands(JsonArrayConst cmds) {
     const char* cmd = c["cmd"] | "";
     bool hasOn = c["on"].is<int>();
     int  on    = hasOn ? (int)c["on"] : -1;
+    Serial.printf("[BD] cmd #%lu %s on=%d\n", (unsigned long)id, cmd, on);
 
     if (!strcmp(cmd, "scan")) {
       bool newState = hasOn ? (on != 0) : !g_scanning;
@@ -381,44 +377,34 @@ static void applyCommands(JsonArrayConst cmds) {
 // ---------------------------------------------------------------------------
 //  WiFi management
 // ---------------------------------------------------------------------------
+// Bring WiFi up to POST. The caller (reportToC2) has already stopped the BLE
+// scan, so the radio is free and association is reliable. WiFi is turned fully
+// off again after the POST so BLE owns the radio during the scan phase.
 static bool ensureWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  // A continuous BLE scan starves the shared 2.4 GHz radio and can stop the STA
-  // from ever associating. Pause scanning for the duration of the connect, then
-  // resume — this is the key fix for "BlueDriver won't connect".
-  bool wasScanning = (pScan && pScan->isScanning());
-  if (wasScanning) { pScan->stop(); delay(20); }
-
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);            // disable modem power-save (stabilises coex)
-  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);            // no modem power-save during the brief window
   WiFi.begin(C2_SSID, C2_PASSWORD);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS)
-    delay(100);
+    delay(50);
   bool ok = (WiFi.status() == WL_CONNECTED);
-  if (ok) Serial.printf("[BD] WiFi connected  ip=%s\n", WiFi.localIP().toString().c_str());
-  else    Serial.println("[BD] WiFi connect timeout");
-
-  if (g_scanning) startScan();     // resume the survey (no-op if already running)
+  Serial.printf("[BD] WiFi %s (%lums)%s\n", ok ? "connected" : "TIMEOUT",
+                (unsigned long)(millis() - t0),
+                ok ? (" ip=" + WiFi.localIP().toString()).c_str() : "");
   return ok;
 }
-
-// Reset just the WiFi stack (leaves NimBLE running) to recover a dropped link.
-static void resetWiFi() {
-  Serial.println("[BD] resetting WiFi (watchdog)");
-  WiFi.disconnect(true, true);
+static void wifiOff() {
+  WiFi.disconnect(true, false);    // disconnect + radio off -> BLE gets the radio
   WiFi.mode(WIFI_OFF);
-  delay(200);
-  g_lastResetMs = millis();
-  ensureWiFi();
 }
 
 // ---------------------------------------------------------------------------
 //  Report cycle: build JSON snapshot and POST to C2
 // ---------------------------------------------------------------------------
 static void reportToC2() {
-  if (!ensureWiFi()) return;
+  stopScan();                      // free the radio so WiFi can associate cleanly
+  delay(40);
+  if (!ensureWiFi()) { wifiOff(); if (g_scanning) startScan(); return; }
 
   JsonDocument doc;
   doc["source"]    = SRC_NAME;
@@ -514,8 +500,12 @@ static void reportToC2() {
 
       applyCommands(rd["commands"].as<JsonArrayConst>());
     }
+  } else {
+    Serial.printf("[BD] POST failed (HTTP %d)\n", code);
   }
   http.end();
+  wifiOff();                        // release the radio back to BLE
+  if (g_scanning) startScan();
 }
 
 // ---------------------------------------------------------------------------
@@ -529,83 +519,55 @@ void setup() {
   setLed(0, 0, 16);                         // boot: dim blue
 
   g_storeMtx = xSemaphoreCreateMutex();
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);            // start with WiFi off; BLE scans first
 
-  // NimBLE — init before WiFi so the coexistence stack is ready
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // max RX sensitivity for scanning
-
   pScan = NimBLEDevice::getScan();
   pScan->setScanCallbacks(&g_scanCB, true);  // true = wantDuplicates (for RSSI)
 
-  // Connect WiFi FIRST (no BLE scan competing for the radio), THEN start the
-  // continuous scan. ensureWiFi() resumes the scan once associated.
-  WiFi.persistent(false);
-  g_lastReportOkMs = millis();    // grace period before the watchdog can fire
-  ensureWiFi();
-  startScan();
-
-  Serial.printf("[BD] BLE scan started (%s)  WiFi=%s\n",
-                g_activeScan ? "active" : "passive",
-                WiFi.isConnected() ? "UP" : "pending");
+  g_lastReportOkMs = millis();    // grace period before the reboot watchdog
+  startScan();                    // the loop interleaves scan <-> report
+  Serial.printf("[BD] BLE scan started (%s); interleaving with WiFi reports\n",
+                g_activeScan ? "active" : "passive");
 }
 
 // ---------------------------------------------------------------------------
 //  Loop  (runs on core 1; NimBLE host task runs on core 0)
 // ---------------------------------------------------------------------------
 void loop() {
-  static uint32_t tReport = 0;
-  static uint32_t tHb     = 0;
+  // ---- BLE SCAN PHASE (WiFi off; BLE owns the radio) ---------------------
+  if (g_scanning && pScan && !pScan->isScanning()) startScan();
+  setLed(g_scanning ? 0 : 8, g_scanning ? 48 : 4, 0);   // green / amber
 
-  // ---- Periodic report ---------------------------------------------------
-  if (millis() - tReport >= REPORT_INTERVAL_MS) {
-    tReport = millis();
-    setLed(0, 0, 48);                       // blue: associating + POSTing
-    reportToC2();
-  }
-
-  // ---- Pending GATT job --------------------------------------------------
-  if (g_gattJob.pending) {
-    g_gattJob.pending = false;
-    setLed(40, 0, 48);                       // purple: GATT enumeration running
-    Serial.printf("[BD] GATT enum -> %s (type %u)\n", g_gattJob.mac, g_gattJob.addrType);
-    String res = doGatt(g_gattJob.mac, g_gattJob.addrType);
-    Serial.printf("[BD] GATT result: %s\n", res.c_str());
-    g_gattResult      = res;
-    g_gattResultReady = true;
-    // Result ships in the very next reportToC2()
-    tReport = 0;   // force an immediate report cycle
-  }
-
-  // ---- Scan-health watchdog: restart a BLE scan that has silently stopped --
-  static uint32_t tScanChk = 0;
-  if (millis() - tScanChk >= 2000) {
-    tScanChk = millis();
-    static uint32_t scanDownSince = 0;
-    if (g_scanning && pScan && !pScan->isScanning() && !g_gattJob.pending) {
-      if (scanDownSince == 0) scanDownSince = millis();
-      else if (millis() - scanDownSince >= SCAN_WATCHDOG_MS) {
-        Serial.println("[BD] BLE scan stalled — restarting");
-        startScan();
-        scanDownSince = 0;
-      }
-    } else {
-      scanDownSince = 0;
+  uint32_t t0 = millis();
+  while (millis() - t0 < SCAN_PHASE_MS) {
+    // Run a queued GATT enumeration during the scan phase (WiFi is off).
+    if (g_gattJob.pending) {
+      g_gattJob.pending = false;
+      setLed(40, 0, 48);                                 // purple: GATT running
+      Serial.printf("[BD] GATT enum -> %s (type %u)\n", g_gattJob.mac, g_gattJob.addrType);
+      String res = doGatt(g_gattJob.mac, g_gattJob.addrType);
+      Serial.printf("[BD] GATT result: %s\n", res.c_str());
+      g_gattResult = res; g_gattResultReady = true;
+      break;                                             // report now to ship it
     }
+    delay(20);
   }
 
-  // ---- Connectivity watchdog: reset WiFi, reboot as a last resort ----------
-  uint32_t sinceOk = millis() - g_lastReportOkMs;
-  if (sinceOk > WIFI_REBOOT_MS) {
+  // ---- REPORT PHASE (BLE scan stopped; WiFi up briefly) -----------------
+  setLed(0, 0, 48);                                      // blue: reporting
+  reportToC2();
+
+  // ---- Reboot watchdog: recover if the C2 has been unreachable too long --
+  if (millis() - g_lastReportOkMs > WIFI_REBOOT_MS) {
     Serial.println("[BD] no C2 contact too long — rebooting");
     delay(50); ESP.restart();
-  } else if (sinceOk > WIFI_WATCHDOG_MS && millis() - g_lastResetMs > WIFI_WATCHDOG_MS) {
-    resetWiFi();
   }
 
-  // idle status colour: green when scanning, amber when paused
-  setLed(g_scanning ? 0 : 8, g_scanning ? 48 : 4, 0);
-
   // ---- Heartbeat ---------------------------------------------------------
+  static uint32_t tHb = 0;
   if (millis() - tHb >= 3000) {
     tHb = millis();
     storeLock();
@@ -615,6 +577,4 @@ void loop() {
                   g_scanning, g_activeScan, n, (unsigned long)nw,
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   }
-
-  delay(20);
 }
