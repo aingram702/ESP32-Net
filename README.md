@@ -204,8 +204,11 @@ Channel-hops 1–13 in promiscuous mode.
 
 ### BlueDriver — BLE scanner + GATT
 
-Continuous passive or active BLE advertisement scan via NimBLE v2.x, with
-WiFi+BLE coexistence handled by the ESP32-S3 arbiter.
+Passive or active BLE advertisement scan via NimBLE v2.x. To keep the WiFi link
+rock-solid it **interleaves the radios** instead of relying on WiFi/BLE
+coexistence: it scans BLE with WiFi off, then briefly stops the scan, brings WiFi
+up only long enough to POST, drops it, and resumes scanning — the two radios are
+never active at the same time, which is what makes association reliable.
 
 **Does:**
 - Per-device inventory: MAC, name, address type, vendor OUI, advertised service
@@ -398,21 +401,27 @@ man 7 esp32-net
 
 ## Reliability & self-healing
 
-The WarDriver and BlueDriver share one 2.4 GHz radio between scanning and the C2
-uplink, which can wedge the WiFi stack over long runs. Both nodes now:
+The nodes share one 2.4 GHz radio between scanning and the C2 uplink, which can
+wedge the WiFi stack over long runs. Mitigations:
 
-- **Disable WiFi modem power-save** (`WiFi.setSleep(false)`) — the main cause of
-  associations silently dropping over time, especially under BLE coexistence.
-- **Cap the BLE scan duty cycle** (BlueDriver: 50%, `SCAN_WINDOW < SCAN_INTERVAL`)
-  so the coexistence arbiter always has airtime to keep the WiFi link alive.
-- **Run watchdogs**: if the BLE scan stalls it is restarted; if the C2 can't be
-  reached for `WIFI_WATCHDOG_MS` the WiFi stack is reset, and after
-  `WIFI_REBOOT_MS` the node reboots. The WarDriver also resets the radio after
-  repeated `scanNetworks()` failures.
+- **BlueDriver interleaves the radios** — it scans BLE with WiFi off, then drops
+  the scan, brings WiFi up only to POST, and resumes. BLE and WiFi never run at
+  once, so association is reliable (this replaced the earlier coexistence/duty-
+  cycle approach, which was the cause of "BlueDriver won't connect").
+- **WarSniffer interleaves** the same way (promiscuous capture ⇄ brief WiFi POST)
+  and runs promiscuous mode in `WIFI_STA` so the driver is reliably started.
+- **WiFi modem power-save is disabled** (`WiFi.setSleep(false)`) on every node.
+- **Watchdogs**: a node reboots if the C2 has been unreachable for
+  `WIFI_*_MS`; the WarDriver also resets the radio after repeated
+  `scanNetworks()` failures.
 - **Re-sync on C2 reboot** so the dashboard and CSV exports repopulate with every
   previously-found device, not just new ones.
 
-Tune the thresholds in each node's `config.h`.
+Control commands are queued on the C2 and **re-sent until the node acks**, so a
+single successful button press is delivered even if the node is mid-cycle; the
+dashboard also retries the POST and only polls the heavy live-capture feed while
+the WarSniffer tab is open, keeping the single-core C2 responsive. Tune the
+thresholds in each node's `config.h`.
 
 ---
 
@@ -423,12 +432,13 @@ Tune the thresholds in each node's `config.h`.
 | Node shows **OFFLINE** | Wrong `C2_SSID`/`C2_PASSWORD`, C2 not flashed/powered, or out of range. Check the node's serial console. |
 | Buttons seem to do nothing | Commands apply on the node's next check-in (a few seconds); watch for the dashboard "queued" toast. If a node is OFFLINE its commands can't be delivered — fix connectivity first. |
 | Dashboard won't load | Confirm you joined `ESP32-NET`; try `http://192.168.4.1/` directly if mDNS fails. |
-| Node drops off after minutes | Addressed by the self-healing above; if it persists, lower `REPORT_INTERVAL_MS` or check power/antenna. |
+| Node drops off after minutes | Addressed by the self-healing above; if it persists, lower the cadence in `config.h` or check power/antenna. |
+| BlueDriver won't connect | Fixed by interleaving (BLE scan and WiFi never run at once). Watch the serial console — each report logs `WiFi connected (Nms)` or `TIMEOUT`. |
+| Buttons hit-and-miss | The node serial log prints each applied command (`cmd #N ...`); if you see the press queued on the dashboard but no `cmd` line, the node isn't checking in — fix connectivity. |
 | WarDriver GPS never fixes | Needs clear sky view; verify TX→RX/RX→TX wiring and `GPS_BAUD`. LED stays cyan until a fix. |
 | `/wigle.csv` is empty | Rows are only logged after a GPS fix. No fix = no rows by design. |
 | CSV export incomplete | The C2 holds up to `MAX_*` of the most-recent devices; raise the caps (RAM permitting) or use the WarDriver's on-flash `/wigle.csv`. |
 | GATT enumeration fails | Device may require bonding, reject the connection, or use a different `addrType`. The error appears in the dashboard GATT panel. |
-| BLE scan rate seems low | Expected: BLE shares the 2.4 GHz radio with WiFi at a 50% scan duty cycle for link stability. |
 | Out-of-memory / resets on C2 | Lower the `MAX_*` store caps in `c2-esp32s2/src/config.h`. |
 
 ---
@@ -443,6 +453,25 @@ responsible for compliance**. Enable channel 14 or any transmit-related option
 only where legally permitted.
 
 By design, ESP32-Net does not send deauthentication or injection frames, does
-not operate a rogue access point, and does not store raw packet payloads or WPA
-handshakes (EAPOL frames are counted, never captured). The SoftAP is
-WPA2-protected; **change the default credentials before use**.
+not operate a rogue access point, and does not store WPA handshakes (EAPOL frames
+are counted, never captured; the live capture keeps only short frame prefixes in
+RAM). The SoftAP is WPA2-protected; **change the default credentials before use**.
+
+### Hardening notes (security review)
+
+The tool ingests attacker-controllable data (SSIDs, BLE names, raw frame bytes),
+so the review focused there:
+
+- **CSV-injection hardened** — exported fields that begin with `= + - @` (or
+  tab/CR) are apostrophe-prefixed so a crafted SSID/name can't execute as a
+  formula when the report is opened in a spreadsheet; embedded quotes/commas are
+  RFC-4180 quoted.
+- **XSS** — all device-supplied strings are HTML-escaped before rendering, and
+  the packet dissector/hex view writes via `textContent`. Watchlist labels are
+  stripped of quote/backslash/control characters on both entry and load.
+- **Frame parsing is bounds-checked** — every read past the 802.11 header is
+  guarded against the captured length, so malformed frames can't over-read.
+- **Known limitation:** the C2 HTTP API has no per-request authentication — it
+  relies on the WPA2-protected SoftAP as the trust boundary. Keep the AP private,
+  change the default password, and don't bridge it to other networks. Adding an
+  API token is left as an opt-in for deployments that need it.

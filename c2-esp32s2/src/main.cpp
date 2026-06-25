@@ -321,6 +321,16 @@ static bool watchNorm(const char* in, char* out, size_t n) {
   }
   return false;
 }
+// Copy a label, stripping CSV/JSON-breaking and control characters. Used on
+// both add (operator input) and load (file on flash) — the label is later
+// emitted raw inside JSON, so this keeps every consumer well-formed.
+static void labelCopy(char* dst, size_t n, const char* src) {
+  size_t j = 0;
+  for (const char* p = src ? src : ""; *p && j < n - 1; p++)
+    if (*p != ',' && *p != '\n' && *p != '\r' && *p != '"' && *p != '\\' && (uint8_t)*p >= 0x20)
+      dst[j++] = *p;
+  dst[j] = 0;
+}
 static void watchSave() {
   if (!g_fsOk) return;
   File f = LittleFS.open(WATCH_PATH, "w");
@@ -335,13 +345,7 @@ static bool watchAdd(const char* mac, const char* label) {
   if (g_watchN >= MAX_WATCH) return false;
   WatchEnt& w = g_watch[g_watchN++];
   strncpy(w.mac, norm, sizeof(w.mac)-1); w.mac[sizeof(w.mac)-1] = 0;
-  // labels are stored unquoted in CSV and emitted raw in JSON; strip separators
-  // and JSON-breaking characters so both stay well-formed.
-  size_t j = 0;
-  for (const char* p = label ? label : ""; *p && j < sizeof(w.label)-1; p++)
-    if (*p != ',' && *p != '\n' && *p != '\r' && *p != '"' && *p != '\\' && (uint8_t)*p >= 0x20)
-      w.label[j++] = *p;
-  w.label[j] = 0;
+  labelCopy(w.label, sizeof(w.label), label);
   g_watchVer++;
   return true;
 }
@@ -370,7 +374,7 @@ static void watchLoad() {
     if (!watchNorm(mac.c_str(), norm, sizeof(norm))) continue;
     WatchEnt& w = g_watch[g_watchN++];
     strncpy(w.mac, norm, sizeof(w.mac)-1); w.mac[sizeof(w.mac)-1] = 0;
-    strncpy(w.label, lbl.c_str(), sizeof(w.label)-1); w.label[sizeof(w.label)-1] = 0;
+    labelCopy(w.label, sizeof(w.label), lbl.c_str());
   }
   f.close();
 }
@@ -519,14 +523,20 @@ static void handleCmdBody(AsyncWebServerRequest* req) {
 //  CSV export — pull collected inventory off the C2 for offline reporting.
 //  GET /api/export/wifi | /api/export/ble | /api/export/sniff
 // ---------------------------------------------------------------------------
-// RFC-4180 minimal CSV field: quote if it contains a comma, quote or newline,
-// and double any embedded quotes.
+// RFC-4180 CSV field with CSV-injection hardening. Values here come from
+// untrusted RF (SSIDs, device names): quote anything with a comma/quote/newline
+// and double embedded quotes, AND neutralise spreadsheet formula injection by
+// prefixing a leading =,+,-,@,TAB,CR with an apostrophe.
 static void csvField(AsyncResponseStream* rs, const char* s) {
   if (!s) s = "";
-  bool quote = false;
-  for (const char* p = s; *p; p++) if (*p==',' || *p=='"' || *p=='\n' || *p=='\r') { quote = true; break; }
+  char c0 = s[0];
+  bool danger = (c0=='=' || c0=='+' || c0=='-' || c0=='@' || c0=='\t' || c0=='\r');
+  bool quote = danger;
+  for (const char* p = s; *p && !quote; p++)
+    if (*p==',' || *p=='"' || *p=='\n' || *p=='\r') quote = true;
   if (!quote) { rs->print(s); return; }
   rs->print('"');
+  if (danger) rs->print('\'');
   for (const char* p = s; *p; p++) { if (*p=='"') rs->print('"'); rs->print(*p); }
   rs->print('"');
 }
